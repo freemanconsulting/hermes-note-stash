@@ -59,7 +59,19 @@ export const cn = (...parts) => parts.filter(Boolean).join(' ')
 export const relativeTime = () => 'now'
 export const usePluginI18n = () => key => key
 export const useValue = store => store.get()
-export const icons = new Proxy({}, { get: () => () => null })
+// Only icons verified to exist in Hermes Desktop's lib/icons.ts at the
+// requires_hermes floor; add a name here only after checking it exists there.
+export const icons = {
+  CornerDownLeft: () => null,
+  FileImage: () => null,
+  ImageIcon: () => null,
+  NotebookTabs: () => null,
+  PencilLine: () => null,
+  Plus: () => null,
+  Send: () => null,
+  Trash2: () => null,
+  X: () => null
+}
 
 export const KEYBINDS_AREA = 'keybinds'
 export const PALETTE_AREA = 'palette'

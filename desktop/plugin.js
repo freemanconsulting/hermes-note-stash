@@ -2304,7 +2304,7 @@ function ImageThumb({ dataUrl, image, onRemove, size = 'h-14 w-14', t }) {
               size,
               'flex items-center justify-center rounded border border-(--stroke-nous) text-(--ui-text-tertiary)'
             ),
-            children: jsx(icons.ImageOff, { 'aria-label': t('imageMissing'), className: 'size-4' })
+            children: jsx(icons.ImageIcon, { 'aria-label': t('imageMissing'), className: 'size-4' })
           }),
       onRemove
         ? jsx('button', {

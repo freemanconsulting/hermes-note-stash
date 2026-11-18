@@ -20,33 +20,51 @@ const plugin = (await import('../desktop/plugin.js')).default
 const sdk = await import('@hermes/plugin-sdk')
 const react = await import('./stubs/react.mjs')
 
+/** Whether a prop value is a rendered element: jsx()/jsxs() output is { type, props }. */
+function looksLikeElement(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && 'type' in value && 'props' in value
+}
+
 /** Walk a rendered element tree, invoking function components with their props. */
-function renderElement(node) {
-  if (node === null || node === undefined || typeof node !== 'object') {
+function renderNode(node) {
+  if (node === null || node === undefined || typeof node === 'boolean' || typeof node === 'string' || typeof node === 'number') {
     return
   }
 
   if (Array.isArray(node)) {
     for (const child of node) {
-      renderElement(child)
+      renderNode(child)
     }
 
     return
   }
 
-  // jsx()/jsxs() output is { type, props }.
-  const { props, type } = node
-
-  if (typeof type === 'function') {
-    // SDK components are stubs returning null; the plugin's own components build trees.
-    renderElement(type(props || {}))
-
+  if (typeof node !== 'object') {
     return
   }
 
-  // String tags and Fragments both carry their children in props.
-  if (props && props.children !== undefined) {
-    renderElement(props.children)
+  if (node.type === undefined) {
+    throw new Error('undefined element type (missing SDK export or icon)')
+  }
+
+  if (typeof node.type === 'function') {
+    // SDK components are stubs returning null; the plugin's own components build trees.
+    renderNode(node.type(node.props ?? {}))
+  }
+
+  // Walk every prop value that looks like an element or an array of them. This
+  // covers `icon`, `trigger`, `content` and — crucially — `children` handed to
+  // an SDK stub, which returns null and would otherwise hide its subtree.
+  for (const value of Object.values(node.props ?? {})) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (looksLikeElement(item)) {
+          renderNode(item)
+        }
+      }
+    } else if (looksLikeElement(value)) {
+      renderNode(value)
+    }
   }
 }
 
@@ -198,11 +216,14 @@ describe('render smoke', () => {
     assert.ok(seeded.includes('waiting'), 'a waiting row is seeded')
     assert.ok(seeded.includes('sent'), 'a sent row is seeded')
 
+    // Every contribution that renders, under both filters. The image note is
+    // active, so the active pass reaches its ImageStrip → ImageThumb → the
+    // missing-file placeholder icon; a broken icon throws from the walk.
     for (const filter of ['active', 'sent']) {
       stash.$filter.set(filter)
 
       for (const contribution of renderables) {
-        renderElement(contribution.render())
+        renderNode(contribution.render())
       }
     }
 
