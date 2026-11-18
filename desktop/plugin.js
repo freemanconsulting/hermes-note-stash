@@ -58,6 +58,10 @@ const SEND_SETTLE_MS = 750
 const WAIT_RETRY_MS = 3000
 const CONFIRM_MS = 8000
 const FOCUS_SETTLE_MS = 1500
+// A paste can be dropped while a transient overlay is still on screen (a tooltip
+// closing, a popover the user just dismissed). Retry briefly before giving up.
+const PASTE_RETRY_COUNT = 4
+const PASTE_RETRY_MS = 250
 const CONFIRM_PREFIX_LENGTH = 40
 const TITLE_LENGTH = 72
 const LABEL_TITLE_LENGTH = 32
@@ -678,7 +682,7 @@ export function dataUrlToFile(dataUrl, name) {
  * An image whose file is missing cannot become a File and is left out; if no
  * image could be built, the paste is not dispatched and the error is shown.
  */
-export async function putInComposerWithImages(note, { insertText, dispatchPaste, focus, notify, sid }) {
+export async function putInComposerWithImages(note, { insertText, dispatchPaste, focus, notify, sid, setTimeout: delay = (fn, ms) => globalThis.setTimeout(fn, ms) }) {
   const body = typeof note?.body === 'string' ? note.body : ''
   const images = Array.isArray(note?.images) ? note.images : []
   const textAdded = Boolean(body.trim())
@@ -719,12 +723,24 @@ export async function putInComposerWithImages(note, { insertText, dispatchPaste,
     return false
   }
 
+  // Each attempt builds a fresh DataTransfer + ClipboardEvent inside
+  // dispatchImagePaste, so a retry is never a re-dispatch of a spent event.
   let handled = false
 
-  try {
-    handled = dispatchPaste(files) === true
-  } catch {
-    handled = false
+  for (let attempt = 0; attempt <= PASTE_RETRY_COUNT; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise(resolve => delay(resolve, PASTE_RETRY_MS))
+    }
+
+    try {
+      handled = dispatchPaste(files) === true
+    } catch {
+      handled = false
+    }
+
+    if (handled) {
+      break
+    }
   }
 
   if (!handled) {
@@ -1922,6 +1938,7 @@ function createStash(ctx) {
           focus: id => host.composer.focus(id),
           insertText: (id, text, options) => host.composer.insertText(id, text, options),
           notify: key => host.notify({ kind: 'error', message: t(key) }),
+          setTimeout: (fn, ms) => ctx.setTimeout(fn, ms),
           sid
         }
       )
@@ -2737,19 +2754,20 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
         className: 'mt-1 flex min-w-0 flex-wrap items-center gap-1',
         children: [
           hasImages
-            ? jsx(Tip, {
-                label: t('putInComposerImagesTip'),
-                children: jsx(Button, {
-                  'aria-label': t('putInComposer'),
-                  disabled: !focused,
-                  onClick: () => stash.putInComposerImages(note),
-                  size: 'xs',
-                  type: 'button',
-                  variant: 'ghost',
-                  children: jsxs('span', {
-                    className: 'inline-flex items-center gap-1',
-                    children: [jsx(icons.PencilLine, { className: 'size-3' }), t('putInComposer')]
-                  })
+            ? jsx(Button, {
+                // No Tip: a Radix tooltip layer over the button makes Desktop's
+                // window paste handler drop the image paste on a real click. The
+                // native title keeps the explanation without a DOM overlay.
+                'aria-label': t('putInComposer'),
+                disabled: !focused,
+                onClick: () => stash.putInComposerImages(note),
+                size: 'xs',
+                title: t('putInComposerImagesTip'),
+                type: 'button',
+                variant: 'ghost',
+                children: jsxs('span', {
+                  className: 'inline-flex items-center gap-1',
+                  children: [jsx(icons.PencilLine, { className: 'size-3' }), t('putInComposer')]
                 })
               })
             : jsx(Tip, {

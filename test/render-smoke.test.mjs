@@ -349,4 +349,92 @@ describe('render smoke', () => {
     assert.ok(textLabels.includes('sendTo'), 'a text-only note keeps its Send button')
     assert.ok(textLabels.includes('putInComposer'), 'a text-only note keeps the secondary Put in composer action')
   })
+
+  /** The first button with this aria-label, plus whether a Tip wraps it. */
+  function findLabeledButton(node, label, inTip = false, found = null) {
+    if (found || node === null || typeof node !== 'object') {
+      return found
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        found = findLabeledButton(child, label, inTip, found)
+
+        if (found) {
+          return found
+        }
+      }
+
+      return found
+    }
+
+    const isTip = node.type === sdk.Tip
+
+    if (node.props?.type === 'button' && node.props['aria-label'] === label) {
+      return { element: node, inTip }
+    }
+
+    if (typeof node.type === 'function' && !isTip) {
+      found = findLabeledButton(node.type(node.props ?? {}), label, inTip, found)
+
+      if (found) {
+        return found
+      }
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            found = findLabeledButton(item, label, inTip || isTip, found)
+
+            if (found) {
+              return found
+            }
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        found = findLabeledButton(value, label, inTip || isTip, found)
+
+        if (found) {
+          return found
+        }
+      }
+    }
+
+    return found
+  }
+
+  it('renders the image Put in composer button without a Tip overlay', () => {
+    const contributions = []
+    const ctx = {
+      i18n: { register: () => {}, t: key => String(key) },
+      onDispose: () => {},
+      onEvent: () => () => {},
+      register: contribution => contributions.push(contribution),
+      setInterval: () => () => {},
+      setTimeout: () => () => {},
+      storage: { get: (key, fallback) => fallback, set: () => {} }
+    }
+
+    sdk.host.state.focusedSessionId.set('sess-1')
+
+    plugin.register(ctx)
+
+    const pane = contributions.find(contribution => contribution.id === 'pane')
+    const stash = pane.render().props.stash
+
+    stash.addNote({
+      body: 'with images',
+      images: [{ bytes: 8, file: 'img-note-img-0.txt', h: 2, mime: 'image/png', w: 3 }],
+      title: 'Images only'
+    })
+
+    const rows = findRows(pane.render())
+    const button = findLabeledButton(rows[0], 'putInComposer')
+
+    assert.ok(button, 'the image note has a Put in composer button')
+    assert.equal(button.inTip, false, 'no Tip ancestor: its popper layer would drop the paste on a real click')
+    assert.equal(button.element.props.title, 'putInComposerImagesTip', 'the explanation stays as the native title')
+  })
 })

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- Fixed: Put in composer for image notes failed on a real mouse click because
+  the button’s tooltip blocked Desktop’s paste handling; the paste now also
+  retries briefly.
+
 ## 1.2.0
 
 - Images in notes: paste or drop PNG, JPEG, GIF, WebP or BMP images into the

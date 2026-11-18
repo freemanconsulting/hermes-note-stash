@@ -220,22 +220,81 @@ describe('putInComposerWithImages', () => {
     assert.deepEqual(notices, [])
   })
 
+  it('retries a dropped paste and succeeds without an error', async () => {
+    const inserts = []
+    const pastes = []
+    const focused = []
+    const notices = []
+    const delays = []
+    let attempt = 0
+
+    const ok = await putInComposerWithImages(
+      { body: 'hello', images: IMAGES },
+      {
+        dispatchPaste: files => {
+          pastes.push(files)
+          attempt += 1
+
+          return attempt >= 3
+        },
+        focus: sid => focused.push(sid),
+        insertText: (sid, body, options) => {
+          inserts.push([sid, body, options])
+
+          return true
+        },
+        notify: message => notices.push(message),
+        setTimeout: (fn, ms) => {
+          delays.push(ms)
+          fn()
+
+          return () => {}
+        },
+        sid: 'sess-1'
+      }
+    )
+
+    assert.equal(ok, true)
+    assert.equal(pastes.length, 3, 'false, false, true is three paste attempts')
+    assert.equal(inserts.length, 1, 'the text goes in once, never again on a retry')
+    assert.deepEqual(delays, [250, 250], 'the attempts are 250 ms apart')
+    assert.deepEqual(notices, [], 'no error when a retry lands')
+    assert.deepEqual(focused, ['sess-1'], 'the composer is focused after the paste lands')
+  })
+
   it('notifies and does not focus when the paste is not handled', async () => {
+    const inserts = []
+    const pastes = []
     const focused = []
     const notices = []
 
     const ok = await putInComposerWithImages(
       { body: 'hello', images: IMAGES },
       {
-        dispatchPaste: () => false,
+        dispatchPaste: files => {
+          pastes.push(files)
+
+          return false
+        },
         focus: sid => focused.push(sid),
-        insertText: () => true,
+        insertText: (sid, body, options) => {
+          inserts.push([sid, body, options])
+
+          return true
+        },
         notify: message => notices.push(message),
+        setTimeout: fn => {
+          fn()
+
+          return () => {}
+        },
         sid: 'sess-1'
       }
     )
 
     assert.equal(ok, false)
+    assert.equal(pastes.length, 5, 'the first attempt plus four retries')
+    assert.equal(inserts.length, 1, 'the text goes in once, never again on a retry')
     assert.deepEqual(notices, ['putInComposerImagesFailedWithText'], 'the text already went in, so the message says so')
     assert.deepEqual(focused, [], 'no focus when the images did not land')
   })
