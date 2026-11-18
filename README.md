@@ -77,11 +77,23 @@ settle delay, re-checks the busy flag, and then submits **one** note per idle
 transition, FIFO per session. The next queued note waits for the next idle
 transition, so a queued note's own turn has to finish first. A queued row shows
 a **Queued** badge (tooltip: "Queued — sends when the turn ends") and a
-**Cancel** action. A submit that fails reports an error and leaves the note
+**Cancel** action.
+
+Desktop only submits to a chat that is on screen: `host.composer.submit` returns
+false when the queued chat is not the focused one at the moment its turn ends.
+That is not a failure. The note becomes **Waiting**, stays at the head of its
+session's FIFO (later notes keep their order behind it), and sends itself once
+that chat is focused again and idle — retried on a focus change, a busy change,
+or a 3 s interval that runs only while a note waits. A waiting row shows a
+**Waiting** badge (tooltip: "The chat was not on screen when its turn ended"),
+a muted `Sends when you open “<title>”` line naming the chat from the title
+cache, and **Cancel**. It never switches your view and never sends to another
+session. A submit that fails on the immediate, not-busy Send path (the chat is
+on screen, so this is a real error) still reports an error and leaves the note
 active.
 
-The queue is in memory only: queued notes revert to Active after an app restart,
-so nothing auto-sends when the app comes back.
+The queue is in memory only: queued and waiting notes revert to Active after an
+app restart, so nothing auto-sends when the app comes back.
 
 ## Privacy and data
 

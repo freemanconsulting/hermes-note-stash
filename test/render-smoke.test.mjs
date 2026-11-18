@@ -103,9 +103,10 @@ describe('render smoke', () => {
     const stash = pane.render().props.stash
 
     // Seed through the plugin's own actions: one active note, one sent note,
-    // and one queued note (send runs the queue's idle path synchronously under
-    // the eager setTimeout; a busy focused session parks the note in the queue),
-    // so every NoteRow branch — active, queued, sent — renders.
+    // one queued note and one waiting note (send runs the queue's idle path
+    // synchronously under the eager setTimeout; a busy focused session parks the
+    // note in the queue, and a submit that returns false parks it as waiting),
+    // so every NoteRow branch — active, queued, waiting, sent — renders.
     stash.addNote({ body: 'active one', title: 'Active one' })
     // Untitled, and a single-line untitled variant: both NoteRow preview
     // branches (preview line, and no preview line) must render.
@@ -116,6 +117,13 @@ describe('render smoke', () => {
     stash.send(stash.$notes.get()[3])
     sdk.host.state.busyBySession.set({ 'sess-1': true })
     stash.addNote({ body: 'queued one', title: 'Queued one' })
+    stash.send(stash.$notes.get()[0])
+    sdk.host.state.busyBySession.set({})
+    // A queued note whose chat is not on screen at turn end: submit returns
+    // false, so the row renders the waiting branch.
+    sdk.host.composer.submit = () => false
+    sdk.host.state.busyBySession.set({ 'sess-1': true })
+    stash.addNote({ body: 'waiting one', title: 'Waiting one' })
     stash.send(stash.$notes.get()[0])
     sdk.host.state.busyBySession.set({})
 

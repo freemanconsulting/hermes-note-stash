@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1
+
+- Queued notes whose chat is not on screen when the turn ends now wait and send
+  when you open that chat, instead of failing. A waiting row shows a **Waiting**
+  badge, a muted line naming the chat, and **Cancel**; it retries on a focus
+  change, a busy change, or a 3 s interval that runs only while a note waits.
+  The immediate, not-busy Send path still reports a real submit failure.
+
 ## 1.1.0 — first public release
 
 - Capture dialog: optional title, monospace body, Tab inserts two spaces,

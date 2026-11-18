@@ -6,10 +6,13 @@
  *    running turn is the whole point of the plugin); it submits exactly once
  *    after busy→idle plus the settle delay; two queued notes go FIFO, one per
  *    idle transition.
- *  - submit returning false reports failure and drops the note from the queue
- *    (the app layer reverts it to active).
- *  - load reverts a persisted `queued` note to `active`; a malformed or missing
- *    notes.json is an empty store and never throws.
+ *  - submit returning false on the queue path holds the note as `waiting` at
+ *    the head of its session's FIFO (no failure event); a retry that succeeds
+ *    sends it once, and the next note waits for the next idle transition.
+ *  - the immediate (not-busy) manual Send path still reports failure and leaves
+ *    the note active.
+ *  - load reverts a persisted `queued`/`waiting` note to `active`; a malformed
+ *    or missing notes.json is an empty store and never throws.
  */
 
 import assert from 'node:assert/strict'
@@ -27,6 +30,8 @@ const {
   titleFromRows,
   titleUpdateFromEvent
 } = await import('../desktop/plugin.js')
+const plugin = (await import('../desktop/plugin.js')).default
+const sdk = await import('@hermes/plugin-sdk')
 
 describe('titleUpdateFromEvent', () => {
   // The live bug: the label stuck on the provisional first-prompt title because
@@ -112,13 +117,16 @@ describe('previewFor', () => {
   })
 })
 
-/** Deterministic timers: nothing fires until `run()`. */
+/** Deterministic timers: nothing fires until `run()` / `tick()`. */
 function fakeTimers() {
   let nextId = 1
   const timers = new Map()
+  const intervals = new Map()
 
   return {
+    clearIntervalFn: id => intervals.delete(id),
     clearTimeoutFn: id => timers.delete(id),
+    intervals: () => intervals.size,
     pending: () => timers.size,
     run: () => {
       const armed = [...timers.values()]
@@ -128,12 +136,24 @@ function fakeTimers() {
         entry.fn()
       }
     },
+    setIntervalFn: (fn, ms) => {
+      const id = nextId
+      nextId += 1
+      intervals.set(id, { fn, ms })
+
+      return id
+    },
     setTimeoutFn: (fn, ms) => {
       const id = nextId
       nextId += 1
       timers.set(id, { fn, ms })
 
       return id
+    },
+    tick: () => {
+      for (const entry of [...intervals.values()]) {
+        entry.fn()
+      }
     }
   }
 }
@@ -172,7 +192,7 @@ describe('send queue', () => {
     timers.run()
 
     assert.deepEqual(submitted, [['s1', 'first']])
-    assert.deepEqual(events, [{ noteId: 'n1', sid: 's1', type: 'sent' }])
+    assert.deepEqual(events, [{ noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' }])
     assert.equal(queue.pending('s1'), 0)
   })
 
@@ -219,35 +239,272 @@ describe('send queue', () => {
     assert.equal(queue.pending('s1'), 0)
   })
 
-  it('reports failure and drops the note when submit returns false', () => {
+  it('holds a note as waiting when submit returns false, with no failure event and one submit', () => {
+    const submitted = []
     const events = []
     const timers = fakeTimers()
 
     const queue = createSendQueue({
+      clearIntervalFn: timers.clearIntervalFn,
       clearTimeoutFn: timers.clearTimeoutFn,
       isBusy: () => false,
       onEvent: event => events.push(event),
+      setIntervalFn: timers.setIntervalFn,
       setTimeoutFn: timers.setTimeoutFn,
-      submit: () => false
+      submit: (sid, body) => {
+        submitted.push([sid, body])
+
+        return false
+      }
     })
 
-    queue.enqueue({ body: 'x', id: 'n1' }, 's1')
-    queue.enqueue({ body: 'y', id: 'n2' }, 's1')
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    queue.enqueue({ body: 'y', id: 'n2' }, 's1', 'default')
     timers.run()
 
+    assert.deepEqual(submitted, [['s1', 'x']], 'only the head note is attempted')
+    assert.deepEqual(events, [{ noteId: 'n1', profile: 'default', sid: 's1', type: 'waiting' }])
+    assert.equal(queue.pending('s1'), 2, 'the waiting head and the note behind it stay queued')
+    assert.equal(timers.intervals(), 1, 'the retry interval runs while a note waits')
+  })
+
+  it('sends a waiting note once on a retry, then the next note waits for the next idle transition', () => {
+    const submitted = []
+    const events = []
+    const timers = fakeTimers()
+    let ok = false
+    let busy = {}
+
+    const queue = createSendQueue({
+      clearIntervalFn: timers.clearIntervalFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: sid => Boolean(busy[sid]),
+      onEvent: event => events.push(event),
+      setIntervalFn: timers.setIntervalFn,
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return ok
+      }
+    })
+
+    queue.enqueue({ body: 'one', id: 'n1' }, 's1', 'default')
+    queue.enqueue({ body: 'two', id: 'n2' }, 's1', 'default')
+    timers.run()
+
+    assert.deepEqual(submitted, ['one'], 'the first attempt fails')
+    assert.equal(queue.pending('s1'), 2)
+
+    ok = true
+    queue.onFocusChange()
+
+    assert.deepEqual(submitted, ['one', 'one'], 'the retry submits the waiting head')
     assert.deepEqual(events, [
-      { noteId: 'n1', sid: 's1', type: 'failed' },
-      { noteId: 'n2', sid: 's1', type: 'dropped' }
+      { noteId: 'n1', profile: 'default', sid: 's1', type: 'waiting' },
+      { noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' }
     ])
-    assert.equal(queue.pending('s1'), 0, 'a failed submit must not retry in a loop')
+    assert.equal(queue.pending('s1'), 1, 'the sent note leaves the queue exactly once')
+    assert.equal(timers.intervals(), 0, 'the retry interval stops when nothing waits')
+
+    queue.onFocusChange()
+
+    assert.deepEqual(submitted, ['one', 'one'], 'the second note must not ride the same retry')
+
+    busy = { s1: true }
+    queue.onBusyChange(busy)
+    busy = { s1: false }
+    queue.onBusyChange(busy)
+    timers.run()
+
+    assert.deepEqual(submitted, ['one', 'one', 'two'], 'the next note waits for the next idle transition')
+    assert.equal(queue.pending('s1'), 0)
+  })
+
+  it('cancels a waiting note back to active and never submits it again', () => {
+    const submitted = []
+    const events = []
+    const timers = fakeTimers()
+
+    const queue = createSendQueue({
+      clearIntervalFn: timers.clearIntervalFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: () => false,
+      onEvent: event => events.push(event),
+      setIntervalFn: timers.setIntervalFn,
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return false
+      }
+    })
+
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    timers.run()
+
+    assert.equal(queue.pending('s1'), 1)
+
+    assert.equal(queue.cancel('n1'), true)
+    assert.deepEqual(events, [
+      { noteId: 'n1', profile: 'default', sid: 's1', type: 'waiting' },
+      { noteId: 'n1', sid: 's1', type: 'cancelled' }
+    ])
+    assert.equal(queue.pending('s1'), 0)
+    assert.equal(timers.intervals(), 0, 'cancelling the only waiting note stops the interval')
+
+    queue.onFocusChange()
+    queue.onBusyChange({})
+    timers.tick()
+    timers.run()
+
+    assert.deepEqual(submitted, ['x'], 'no submit attempt after the cancel')
+  })
+})
+
+/** Register the real plugin against a fake ctx and return the stash handle. */
+function registerStash({ submit }) {
+  const contributions = []
+  const disposers = []
+  const storage = new Map()
+
+  sdk.host.composer.submit = submit
+
+  const ctx = {
+    files: undefined, // force the ctx.storage persistence path
+    i18n: {
+      register: () => {},
+      t: key => String(key)
+    },
+    onDispose: disposer => disposers.push(disposer),
+    onEvent: () => () => {},
+    register: contribution => contributions.push(contribution),
+    setInterval: () => () => {},
+    // Fire immediately: the queue's settle delay then runs synchronously.
+    setTimeout: fn => {
+      fn()
+
+      return () => {}
+    },
+    storage: {
+      get: (key, fallback) => (storage.has(key) ? storage.get(key) : fallback),
+      set: (key, value) => storage.set(key, value)
+    }
+  }
+
+  plugin.register(ctx)
+
+  const pane = contributions.find(contribution => contribution.id === 'pane')
+
+  return { disposers, stash: pane.render().props.stash }
+}
+
+describe('app send paths', () => {
+  it('reports failure and leaves the note active on the immediate manual path', () => {
+    const notifications = []
+    sdk.host.notify = notification => notifications.push(notification)
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.busyBySession.set({})
+
+    const { disposers, stash } = registerStash({ submit: () => false })
+    const note = stash.addNote({ body: 'manual', title: 'Manual' })
+
+    stash.send(note)
+
+    assert.equal(notifications.length, 1, 'the immediate path still reports the failure')
+    assert.equal(notifications[0].message, 'sendFailed')
+    assert.equal(stash.$notes.get()[0].status, 'active', 'the note stays active')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('marks a queued note waiting when its chat is off screen, then sends it on a focus change', () => {
+    const notifications = []
+    const submitted = []
+    let ok = false
+    sdk.host.notify = notification => notifications.push(notification)
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.busyBySession.set({})
+
+    const { disposers, stash } = registerStash({
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return ok
+      }
+    })
+    const note = stash.addNote({ body: 'later', title: 'Later' })
+
+    sdk.host.state.busyBySession.set({ 'sess-1': true })
+    stash.send(note)
+
+    assert.equal(stash.$notes.get()[0].status, 'queued')
+
+    // Turn ends while the user is on another chat: submit is fail-closed.
+    sdk.host.state.busyBySession.set({})
+
+    assert.equal(stash.$notes.get()[0].status, 'waiting')
+    assert.equal(stash.$notes.get()[0].sid, 'sess-1', 'the target chat is recorded')
+    assert.equal(stash.$notes.get()[0].profile, 'default', 'the target profile is recorded')
+    assert.deepEqual(notifications, [], 'waiting is silent')
+
+    ok = true
+    sdk.host.state.focusedSessionId.set('sess-2')
+
+    assert.equal(stash.$notes.get()[0].status, 'sent', 'the retry sends it once')
+    assert.deepEqual(submitted, ['later', 'later'])
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('cancels a waiting note back to active and stops retrying it', () => {
+    const submitted = []
+    sdk.host.notify = () => {}
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.busyBySession.set({})
+
+    const { disposers, stash } = registerStash({
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return false
+      }
+    })
+    const note = stash.addNote({ body: 'later', title: 'Later' })
+
+    sdk.host.state.busyBySession.set({ 'sess-1': true })
+    stash.send(note)
+    sdk.host.state.busyBySession.set({})
+
+    assert.equal(stash.$notes.get()[0].status, 'waiting')
+
+    stash.cancelQueued(note.id)
+
+    assert.equal(stash.$notes.get()[0].status, 'active')
+    assert.deepEqual(stash.$notes.get()[0].sid, undefined, 'the target chat is cleared')
+
+    const attempts = submitted.length
+    sdk.host.state.focusedSessionId.set('sess-2')
+    sdk.host.state.busyBySession.set({})
+
+    assert.equal(submitted.length, attempts, 'no submit attempt after the cancel')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
   })
 })
 
 describe('persistence', () => {
-  it('reverts a persisted queued note to active on load', () => {
+  it('reverts a persisted queued or waiting note to active on load', () => {
     const text = JSON.stringify({
       notes: [
         { body: 'queued one', createdAt: 1, id: 'n1', status: 'queued', title: '', updatedAt: 2 },
+        { body: 'waiting one', createdAt: 1, id: 'n3', profile: 'default', sid: 's1', status: 'waiting', title: '', updatedAt: 2 },
         { body: 'sent one', createdAt: 3, id: 'n2', sentAt: 5, sentTo: 's1', status: 'sent', title: 'Sent', updatedAt: 4 }
       ],
       version: 1
@@ -255,11 +512,12 @@ describe('persistence', () => {
 
     const notes = parseNotesFile(text)
 
-    assert.equal(notes.length, 2)
+    assert.equal(notes.length, 3)
     assert.equal(notes[0].status, 'active', 'an in-memory queue cannot survive a restart')
-    assert.equal(notes[1].status, 'sent')
-    assert.equal(notes[1].sentTo, 's1')
-    assert.equal(notes[1].sentAt, 5)
+    assert.equal(notes[1].status, 'active', 'a waiting note must not auto-send after a restart')
+    assert.equal(notes[2].status, 'sent')
+    assert.equal(notes[2].sentTo, 's1')
+    assert.equal(notes[2].sentAt, 5)
   })
 
   it('yields an empty store for a malformed or missing notes.json', () => {

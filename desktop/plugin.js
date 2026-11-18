@@ -55,6 +55,7 @@ const NOTES_FILE = 'notes.json'
 const NOTES_VERSION = 1
 const WRITE_DEBOUNCE_MS = 300
 const SEND_SETTLE_MS = 750
+const WAIT_RETRY_MS = 3000
 const TITLE_LENGTH = 72
 const LABEL_TITLE_LENGTH = 32
 const KEYBIND_ID = 'note-stash.new-note'
@@ -223,9 +224,9 @@ export function createNote(input, now = Date.now()) {
 }
 
 /**
- * One persisted note, validated. A `queued` status is reverted to `active`:
- * the send queue is in-memory only, so a note queued before a restart must not
- * auto-send when the app comes back.
+ * One persisted note, validated. A `queued` or `waiting` status is reverted to
+ * `active`: the send queue is in-memory only, so a note queued or waiting before
+ * a restart must not auto-send when the app comes back.
  */
 export function normalizeNote(raw, now = Date.now()) {
   if (!raw || typeof raw !== 'object') {
@@ -318,7 +319,11 @@ export function removeNote(notes, id) {
   return notes.filter(note => note.id !== id)
 }
 
-/** Status transition. `sent` stamps sentAt/sentTo; anything else clears them. */
+/**
+ * Status transition. `sent` stamps sentAt/sentTo; anything else clears them.
+ * `queued` and `waiting` also record the target chat (`profile` + `sid`) so the
+ * waiting row can name the chat it will send to; any other status clears them.
+ */
 export function setNoteStatus(notes, id, status, extra = {}, now = Date.now()) {
   return notes.map(note => {
     if (note.id !== id) {
@@ -336,6 +341,19 @@ export function setNoteStatus(notes, id, status, extra = {}, now = Date.now()) {
     } else {
       delete next.sentAt
       delete next.sentTo
+    }
+
+    if (status === 'queued' || status === 'waiting') {
+      if (typeof extra.profile === 'string' && extra.profile) {
+        next.profile = extra.profile
+      }
+
+      if (typeof extra.sid === 'string' && extra.sid) {
+        next.sid = extra.sid
+      }
+    } else {
+      delete next.profile
+      delete next.sid
     }
 
     return next
@@ -368,20 +386,28 @@ export function filterNotes(notes, { filter = 'active', search = '' } = {}) {
  *  - `waitingBusy` the target is mid-turn; wait for busy → idle.
  *  - `awaitingTurn` a note was just submitted; the next one waits until this
  *                  turn has been observed busy AND then idle again.
+ *  - `waiting`     the submit returned false because the chat was not on screen
+ *                  (host.composer.submit is fail-closed); the head note stays
+ *                  queued in place and is retried on a focus change, a busy
+ *                  change, or a 3 s interval that only runs while one waits.
  *
  * Injected: `submit(sid, body) → boolean`, `isBusy(sid) → boolean`, timers,
- * clock, and `onEvent` (`sent` / `failed` / `dropped` / `cancelled`). No
- * globals, no host access — the app layer wires those in.
+ * clock, and `onEvent` (`sent` / `waiting` / `cancelled`). No globals, no host
+ * access — the app layer wires those in.
  */
 export function createSendQueue({
   submit,
   isBusy,
   setTimeoutFn = (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeoutFn = handle => globalThis.clearTimeout(handle),
+  setIntervalFn = (fn, ms) => globalThis.setInterval(fn, ms),
+  clearIntervalFn = handle => globalThis.clearInterval(handle),
   settleMs = SEND_SETTLE_MS,
+  waitRetryMs = WAIT_RETRY_MS,
   onEvent = () => {}
 }) {
   const sessions = new Map()
+  let waitTimer = null
 
   const record = sid => {
     let entry = sessions.get(sid)
@@ -401,6 +427,78 @@ export function createSendQueue({
     }
   }
 
+  /** One submit attempt. A throw is a false result, never a crash. */
+  const submitItem = item => {
+    try {
+      return submit(item.sid, item.body) === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Retry every waiting head whose session is idle. A success is the same
+   * bookkeeping as a normal submit: shift the head, arm `awaitingTurn` so the
+   * next queued note waits for the next idle transition, and emit `sent` once.
+   * A failure stays waiting silently.
+   */
+  const retryWaiting = onlySid => {
+    for (const [sid, entry] of sessions) {
+      if (onlySid && sid !== onlySid) {
+        continue
+      }
+
+      if (entry.phase !== 'waiting' || isBusy(sid)) {
+        continue
+      }
+
+      const item = entry.items[0]
+
+      if (!item) {
+        entry.phase = 'idle'
+
+        continue
+      }
+
+      if (!submitItem(item)) {
+        continue
+      }
+
+      entry.items.shift()
+      entry.phase = 'awaitingTurn'
+      entry.sawBusy = false
+      onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'sent' })
+    }
+
+    syncWaitTimer()
+  }
+
+  /** The 3 s retry interval runs ONLY while at least one entry is waiting. */
+  const syncWaitTimer = () => {
+    let waiting = false
+
+    for (const entry of sessions.values()) {
+      if (entry.phase === 'waiting') {
+        waiting = true
+
+        break
+      }
+    }
+
+    if (waiting) {
+      if (waitTimer === null) {
+        waitTimer = setIntervalFn(() => retryWaiting(), waitRetryMs)
+      }
+
+      return
+    }
+
+    if (waitTimer !== null) {
+      clearIntervalFn(waitTimer)
+      waitTimer = null
+    }
+  }
+
   const pump = sid => {
     const entry = record(sid)
 
@@ -410,7 +508,7 @@ export function createSendQueue({
       return
     }
 
-    if (entry.phase === 'settling' || entry.phase === 'awaitingTurn') {
+    if (entry.phase === 'settling' || entry.phase === 'awaitingTurn' || entry.phase === 'waiting') {
       return
     }
 
@@ -443,24 +541,12 @@ export function createSendQueue({
         return
       }
 
-      let ok = false
-
-      try {
-        ok = submit(item.sid, item.body) === true
-      } catch {
-        ok = false
-      }
-
-      if (!ok) {
-        const rest = entry.items.slice(1)
-        entry.items = []
-        entry.phase = 'idle'
-        entry.sawBusy = false
-        onEvent({ noteId: item.noteId, sid, type: 'failed' })
-
-        for (const other of rest) {
-          onEvent({ noteId: other.noteId, sid, type: 'dropped' })
-        }
+      if (!submitItem(item)) {
+        // The chat was not on screen: hold the head note in place (later notes
+        // stay behind it) and retry when focus or busy changes, or on the tick.
+        entry.phase = 'waiting'
+        onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'waiting' })
+        syncWaitTimer()
 
         return
       }
@@ -468,17 +554,22 @@ export function createSendQueue({
       entry.items.shift()
       entry.phase = 'awaitingTurn'
       entry.sawBusy = false
-      onEvent({ noteId: item.noteId, sid, type: 'sent' })
+      onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'sent' })
     }, settleMs)
   }
 
-  const enqueue = (note, sid) => {
+  const enqueue = (note, sid, profile) => {
     if (!sid || !note || !note.id) {
       return false
     }
 
     const entry = record(sid)
-    entry.items.push({ body: typeof note.body === 'string' ? note.body : '', noteId: note.id, sid })
+    entry.items.push({
+      body: typeof note.body === 'string' ? note.body : '',
+      noteId: note.id,
+      profile: typeof profile === 'string' && profile ? profile : 'default',
+      sid
+    })
     pump(sid)
 
     return true
@@ -496,6 +587,13 @@ export function createSendQueue({
           clearTimer(entry)
           entry.phase = 'waitingBusy'
         }
+
+        continue
+      }
+
+      if (entry.phase === 'waiting') {
+        // A busy change may be the turn ending: retry this session's head.
+        retryWaiting(sid)
 
         continue
       }
@@ -519,6 +617,9 @@ export function createSendQueue({
     }
   }
 
+  /** Focus moved: the chat a waiting note targets may now be on screen. */
+  const onFocusChange = () => retryWaiting()
+
   const cancel = noteId => {
     for (const [sid, entry] of sessions) {
       const index = entry.items.findIndex(item => item.noteId === noteId)
@@ -532,9 +633,15 @@ export function createSendQueue({
       if (!entry.items.length) {
         clearTimer(entry)
         entry.phase = 'idle'
+      } else if (index === 0 && entry.phase === 'waiting') {
+        // The waiting head is gone; the next note is an ordinary queued one.
+        entry.phase = 'idle'
+        entry.sawBusy = false
+        pump(sid)
       }
 
       onEvent({ noteId, sid, type: 'cancelled' })
+      syncWaitTimer()
 
       return true
     }
@@ -549,10 +656,15 @@ export function createSendQueue({
       clearTimer(entry)
     }
 
+    if (waitTimer !== null) {
+      clearIntervalFn(waitTimer)
+      waitTimer = null
+    }
+
     sessions.clear()
   }
 
-  return { cancel, dispose, enqueue, onBusyChange, pending }
+  return { cancel, dispose, enqueue, onBusyChange, onFocusChange, pending }
 }
 
 // ── Persistence (ctx.files, else ctx.storage) ──────────────────────────────
@@ -737,6 +849,8 @@ function createStash(ctx) {
     isBusy: sid => Boolean(host.state.busyBySession.get()[sid]),
     setTimeoutFn: (fn, ms) => ctx.setTimeout(fn, ms),
     clearTimeoutFn: handle => handle(),
+    setIntervalFn: (fn, ms) => ctx.setInterval(fn, ms),
+    clearIntervalFn: stop => stop(),
     onEvent: event => {
       if (event.type === 'sent') {
         $notes.set(setNoteStatus($notes.get(), event.noteId, 'sent', { sentAt: Date.now(), sentTo: event.sid }))
@@ -745,15 +859,21 @@ function createStash(ctx) {
         return
       }
 
-      if (event.type === 'failed') {
-        $notes.set(setNoteStatus($notes.get(), event.noteId, 'active'))
+      if (event.type === 'waiting') {
+        // In-memory like `queued`: the chat was not on screen at turn end. No
+        // error — the queue retries when the chat becomes visible and idle.
+        $notes.set(
+          setNoteStatus($notes.get(), event.noteId, 'waiting', {
+            profile: event.profile,
+            sid: event.sid
+          })
+        )
         persistence.schedule($notes.get())
-        host.notify({ kind: 'error', message: t('sendFailed') })
 
         return
       }
 
-      if (event.type === 'dropped' || event.type === 'cancelled') {
+      if (event.type === 'cancelled') {
         $notes.set(setNoteStatus($notes.get(), event.noteId, 'active'))
         persistence.schedule($notes.get())
       }
@@ -761,6 +881,9 @@ function createStash(ctx) {
   })
 
   ctx.onDispose(host.state.busyBySession.subscribe(map => queue.onBusyChange(map)))
+  // Focus moving is the main way a waiting note's chat becomes on screen.
+  ctx.onDispose(host.state.focusedSessionId.subscribe(() => queue.onFocusChange()))
+  ctx.onDispose(host.state.focusedStoredSessionId.subscribe(() => queue.onFocusChange()))
 
   // The gateway emits `session.info` with `payload.title` whenever a chat's
   // title changes — the provisional first-prompt title, then the generated one
@@ -888,7 +1011,7 @@ function createStash(ctx) {
       persist()
     },
     send: note => {
-      if (!note || note.status === 'sent' || note.status === 'queued') {
+      if (!note || note.status === 'sent' || note.status === 'queued' || note.status === 'waiting') {
         return
       }
 
@@ -901,9 +1024,16 @@ function createStash(ctx) {
         return
       }
 
+      // Record the target chat's profile with the queued entry so a waiting row
+      // can name it (`${profile}:${sid}` title lookup).
+      const targetProfile =
+        String(host.state.focusedSessionProfile.get() ?? '') ||
+        String(host.state.profile.get() ?? '') ||
+        'default'
+
       if (Boolean(host.state.busyBySession.get()[sid])) {
-        if (queue.enqueue(note, sid)) {
-          $notes.set(setNoteStatus($notes.get(), note.id, 'queued'))
+        if (queue.enqueue(note, sid, targetProfile)) {
+          $notes.set(setNoteStatus($notes.get(), note.id, 'queued', { profile: targetProfile, sid }))
           persist()
         }
 
@@ -1241,6 +1371,7 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
   const primaryProfile = useValue(host.state.profile)
   const sent = note.status === 'sent'
   const queued = note.status === 'queued'
+  const waiting = note.status === 'waiting'
   const title = deriveTitle(note, t('untitled'))
   const preview = previewFor(note)
   const stamp = relativeTime(Number.isFinite(note.updatedAt) ? note.updatedAt : note.createdAt)
@@ -1250,6 +1381,9 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
     String(focusedProfile || '') || String(primaryProfile || '') || 'default'
   const sendTitle = lookupSendTitle(titles, titleProfile, host.state.focusedStoredSessionId.get(), focused)
   const sendLabel = focused ? t('sendTo', sendTitle) : t('noSession')
+  // A waiting note names the chat it will send to, from the title cache keyed
+  // by the profile recorded when it was queued; no cached title → generic line.
+  const waitingTitle = waiting ? titles[`${note.profile || titleProfile}:${note.sid}`] || '' : ''
 
   // Secondary actions stay in the flow (no layout shift) but fade in on row
   // hover or focus-within — tabbing into one reveals the whole cluster, so they
@@ -1310,6 +1444,34 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
             ]
           })
         : null,
+      waiting
+        ? jsxs('div', {
+            className: 'mt-1 flex min-w-0 flex-wrap items-center gap-1.5',
+            children: [
+              jsx(Tip, {
+                label: t('waitingTip'),
+                children: jsx(Badge, {
+                  className: 'shrink-0',
+                  size: 'xs',
+                  variant: 'outline',
+                  children: t('statusWaiting')
+                })
+              }),
+              jsx('span', {
+                className: 'min-w-0 break-words text-[0.625rem] leading-[1.45] text-(--ui-text-tertiary)',
+                children: t('waitingLine', waitingTitle)
+              }),
+              jsx(Button, {
+                className: 'shrink-0',
+                onClick: () => stash.cancelQueued(note.id),
+                size: 'micro',
+                type: 'button',
+                variant: 'text',
+                children: t('cancelQueued')
+              })
+            ]
+          })
+        : null,
       jsxs('div', {
         className: 'mt-1 flex min-w-0 flex-wrap items-center gap-1',
         children: [
@@ -1317,7 +1479,7 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
             label: sendLabel,
             children: jsx(Button, {
               'aria-label': sendLabel,
-              disabled: sent || queued || !focused,
+              disabled: sent || queued || waiting || !focused,
               onClick: () => stash.send(note),
               size: 'xs',
               type: 'button',
@@ -1591,10 +1753,13 @@ export default {
         sendTo: title => sendLabelFor(title),
         sentAgo: when => `sent ${when}`,
         statusQueued: 'Queued',
+        statusWaiting: 'Waiting',
         storageFallback: error =>
           `Note Stash is saving notes in app storage (file save unavailable: ${error}).`,
         titlePlaceholder: 'Title (optional)',
-        untitled: 'Untitled note'
+        untitled: 'Untitled note',
+        waitingLine: title => title ? `Sends when you open “${title}”` : 'Sends when you open that chat',
+        waitingTip: 'The chat was not on screen when its turn ended'
       }
     })
 
