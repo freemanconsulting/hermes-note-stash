@@ -17,6 +17,7 @@ import { installStubs } from './loader.mjs'
 installStubs()
 
 const plugin = (await import('../desktop/plugin.js')).default
+const { VERSION } = await import('../desktop/plugin.js')
 const sdk = await import('@hermes/plugin-sdk')
 const react = await import('./stubs/react.mjs')
 
@@ -137,6 +138,86 @@ describe('render smoke', () => {
         }
       } else if (looksLikeElement(value)) {
         buttonLabels(value, out)
+      }
+    }
+
+    return out
+  }
+
+  /** Every Badge element in the tree. */
+  function findBadges(node, out = []) {
+    if (node === null || typeof node !== 'object') {
+      return out
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        findBadges(child, out)
+      }
+
+      return out
+    }
+
+    if (node.type === sdk.Badge) {
+      out.push(node)
+    }
+
+    if (typeof node.type === 'function') {
+      findBadges(node.type(node.props ?? {}), out)
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            findBadges(item, out)
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        findBadges(value, out)
+      }
+    }
+
+    return out
+  }
+
+  /** Every string in the tree, including a stub component's children. */
+  function collectText(node, out = []) {
+    if (node === null || node === undefined || typeof node === 'boolean') {
+      return out
+    }
+
+    if (typeof node === 'string' || typeof node === 'number') {
+      out.push(String(node))
+
+      return out
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        collectText(child, out)
+      }
+
+      return out
+    }
+
+    if (typeof node !== 'object') {
+      return out
+    }
+
+    if (typeof node.type === 'function') {
+      collectText(node.type(node.props ?? {}), out)
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (typeof item === 'string' || looksLikeElement(item)) {
+            collectText(item, out)
+          }
+        }
+      } else if (typeof value === 'string' || looksLikeElement(value)) {
+        collectText(value, out)
       }
     }
 
@@ -308,6 +389,44 @@ describe('render smoke', () => {
     // Effects ran during the walk; run their cleanups now, so a cleanup that
     // throws also fails the test.
     react.runEffectCleanups()
+  })
+
+  it('renders the In composer badge and the version in the pane header', async () => {
+    const contributions = []
+    const ctx = {
+      i18n: { register: () => {}, t: key => String(key) },
+      onDispose: () => {},
+      onEvent: () => () => {},
+      register: contribution => contributions.push(contribution),
+      setInterval: () => () => {},
+      // Hold the ten-minute composing timer: the badge must render while live.
+      setTimeout: () => () => {},
+      storage: { get: (key, fallback) => fallback, set: () => {} }
+    }
+
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.composer.insertText = async () => true
+
+    plugin.register(ctx)
+
+    const pane = contributions.find(contribution => contribution.id === 'pane')
+    const stash = pane.render().props.stash
+    const note = stash.addNote({ body: 'in composer note', title: 'Composer' })
+
+    // Seed through the plugin's own Put in composer path with a successful insert.
+    await stash.putInComposer(note)
+
+    assert.deepEqual(stash.$composing.get().map(record => record.noteId), [note.id])
+
+    const tree = pane.render()
+
+    assert.ok(
+      findBadges(tree).some(
+        badge => badge.props.children === 'inComposer' && badge.props.variant === 'muted'
+      ),
+      'the row shows the muted In composer badge'
+    )
+    assert.ok(collectText(tree).includes(`v${VERSION}`), 'the pane header shows the version')
   })
 
   it('renders an image note with Put in composer as its labeled action and no Send', () => {

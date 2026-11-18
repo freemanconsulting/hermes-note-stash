@@ -59,9 +59,15 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
     queued (see "Why the busy queue").
   - **Put in composer** — appends the body to the focused session's existing
     draft (`host.composer.insertText(sid, body, { mode: 'block' })`, never
-    clobbers it) and then focuses the composer; the note stays active. For a
-    note with images this is the labeled action instead of **Send**: it adds the
-    text and the images (see "Images").
+    clobbers it) and then focuses the composer. The note stays Active with a
+    muted **In composer** badge (tooltip: "Press Enter in the chat to send. Moves
+    to Sent when it is sent.") until the chat sends it: pressing Enter starts a
+    turn with that text, which moves the note to Sent. The badge clears silently
+    after ten minutes, on an edit or delete, on a send another way, or when
+    another note is put in the composer for the same chat; nothing is persisted,
+    so a restart leaves the note Active. For a note with images this is the
+    labeled action instead of **Send**: it adds the text and the images (see
+    "Images").
   - **Copy** — copies the body to the clipboard. Text only, like **Put in
     composer**.
   - **Delete** — removes the note after a confirmation.
@@ -86,9 +92,11 @@ A note with images has **Put in composer** as its labeled action instead of
 dispatches a synthetic paste event carrying one image File per stored image;
 Desktop's own paste handling turns that into real attachment chips in that
 chat's composer, the same path as a real Cmd+V. Nothing is sent until you press
-Enter. If the paste is not handled (an open dialog, or no composer to take it),
-Note Stash shows an error and leaves the text it already added in place. An
-images-only note adds just its images. **Copy** stays text-only.
+Enter; pressing Enter starts a turn with that text (or, for an images-only note,
+any turn in that chat), which moves the note to Sent and clears its **In
+composer** badge. If the paste is not handled (an open dialog, or no composer to
+take it), Note Stash shows an error and leaves the text it already added in
+place. An images-only note adds just its images. **Copy** stays text-only.
 
 ## Why the busy queue
 

@@ -63,9 +63,17 @@ const FOCUS_SETTLE_MS = 1500
 const PASTE_RETRY_COUNT = 4
 const PASTE_RETRY_MS = 250
 const CONFIRM_PREFIX_LENGTH = 40
+// A note put in the composer is only "in composer" while the user is plausibly
+// about to press Enter; after ten minutes the badge clears and the note stays
+// Active (in memory only, like `queued` — nothing survives a restart).
+const COMPOSING_TIMEOUT_MS = 10 * 60 * 1000
 const TITLE_LENGTH = 72
 const LABEL_TITLE_LENGTH = 32
 const KEYBIND_ID = 'note-stash.new-note'
+
+/** The plugin version, shown in the pane header. ONE source: the test asserts
+ *  it equals `plugin.yaml` and `package.json`. */
+export const VERSION = '1.2.2'
 
 // Images are one flat UTF-8 text file per image in the plugin data folder,
 // holding exactly one data URL. `ctx.files.writeText` is UTF-8 only and capped
@@ -844,7 +852,7 @@ export function filterNotes(notes, { filter = 'active', search = '' } = {}) {
  * Confirmed when the event is for `sid` and either `payload.running` is true or
  * a `payload.pending` entry's text starts with the first 40 chars of the body.
  */
-export function sessionInfoConfirms(ev, sid, body) {
+export function sessionInfoConfirms(ev, sid, body, { running = true } = {}) {
   if (!ev || typeof ev !== 'object' || typeof sid !== 'string' || !sid) {
     return false
   }
@@ -858,7 +866,9 @@ export function sessionInfoConfirms(ev, sid, body) {
     return false
   }
 
-  if (payload.running === true) {
+  // A note put in the composer is confirmed only by a pending prompt matching
+  // its own text: `running` alone could be any turn, so it is opt-out.
+  if (running && payload.running === true) {
     return true
   }
 
@@ -886,6 +896,135 @@ export function sessionInfoConfirms(ev, sid, body) {
   }
 
   return false
+}
+
+/**
+ * The in-memory "in composer" state. Put in composer does not send a note, so
+ * the note stays Active; this record is what the row's muted badge reads. At
+ * most one record per session: a newer Put in composer replaces it.
+ *
+ * Confirmation, exactly once per record:
+ *  - a note with text is confirmed by a `session.info` event for its session
+ *    whose `payload.pending` entry starts with the note's own prefix;
+ *  - an images-only note (no prefix) is confirmed by its session's busy flag
+ *    flipping false → true, i.e. a turn starting.
+ * A ten-minute timeout, a delete/edit, or a send another way clears the record
+ * silently: the note stays Active and the badge disappears.
+ */
+export function createComposingTracker({
+  clearTimeoutFn = handle => handle(),
+  now = () => Date.now(),
+  onConfirm = () => {},
+  onChange = () => {},
+  setTimeoutFn = (fn, ms) => globalThis.setTimeout(fn, ms)
+} = {}) {
+  const records = new Map()
+  let lastBusy = {}
+
+  const drop = sid => {
+    const record = records.get(sid)
+
+    if (!record) {
+      return false
+    }
+
+    if (record.timer !== null) {
+      clearTimeoutFn(record.timer)
+      record.timer = null
+    }
+
+    records.delete(sid)
+
+    return true
+  }
+
+  const confirm = record => {
+    if (records.get(record.sid) !== record) {
+      return false
+    }
+
+    if (record.timer !== null) {
+      clearTimeoutFn(record.timer)
+      record.timer = null
+    }
+
+    records.delete(record.sid)
+    onConfirm(record)
+    onChange()
+
+    return true
+  }
+
+  return {
+    clear: noteId => {
+      for (const record of records.values()) {
+        if (record.noteId === noteId) {
+          if (drop(record.sid)) {
+            onChange()
+          }
+
+          return true
+        }
+      }
+
+      return false
+    },
+    dispose: () => {
+      for (const sid of [...records.keys()]) {
+        drop(sid)
+      }
+    },
+    onBusyChange: busy => {
+      const map = busy && typeof busy === 'object' ? busy : {}
+
+      for (const record of [...records.values()]) {
+        // A prefixed note needs its own prompt text; a busy flip alone is not proof.
+        if (!record.prefix && map[record.sid] === true && lastBusy[record.sid] !== true) {
+          confirm(record)
+        }
+      }
+
+      lastBusy = { ...map }
+    },
+    onSessionInfo: event => {
+      for (const record of [...records.values()]) {
+        if (record.prefix && sessionInfoConfirms(event, record.sid, record.prefix, { running: false })) {
+          confirm(record)
+        }
+      }
+    },
+    put: ({ body, noteId, profile = '', sid }) => {
+      if (typeof sid !== 'string' || !sid || typeof noteId !== 'string' || !noteId) {
+        return null
+      }
+
+      drop(sid)
+
+      const trimmed = typeof body === 'string' ? body.trim() : ''
+      const record = {
+        noteId,
+        prefix: trimmed.slice(0, CONFIRM_PREFIX_LENGTH),
+        profile,
+        sid,
+        startedAt: now(),
+        timer: null
+      }
+
+      records.set(sid, record)
+      record.timer = setTimeoutFn(() => {
+        record.timer = null
+
+        if (records.get(sid) === record) {
+          records.delete(sid)
+          onChange()
+        }
+      }, COMPOSING_TIMEOUT_MS)
+      onChange()
+
+      return record
+    },
+    records: () => [...records.values()]
+  }
 }
 
 /**
@@ -1648,6 +1787,21 @@ function createStash(ctx) {
   const $imageData = atom({})
   const persistence = createPersistence(ctx, t)
   const imageStore = createImageStore(ctx)
+  const $composing = atom([])
+  const composing = createComposingTracker({
+    clearTimeoutFn: handle => handle(),
+    onChange: () => $composing.set(composing.records()),
+    onConfirm: record => {
+      $notes.set(
+        setNoteStatus($notes.get(), record.noteId, 'sent', {
+          sentAt: Date.now(),
+          sentTo: record.sid
+        })
+      )
+      persistence.schedule($notes.get())
+    },
+    setTimeoutFn: (fn, ms) => ctx.setTimeout(fn, ms)
+  })
   let imagesDisabledNotified = false
 
   const queue = createSendQueue({
@@ -1696,7 +1850,13 @@ function createStash(ctx) {
     }
   })
 
-  ctx.onDispose(host.state.busyBySession.subscribe(map => queue.onBusyChange(map)))
+  ctx.onDispose(
+    host.state.busyBySession.subscribe(map => {
+      queue.onBusyChange(map)
+      // An images-only note in the composer is confirmed by the turn starting.
+      composing.onBusyChange(map)
+    })
+  )
   // Focus moving is the main way a waiting note's chat becomes on screen. Both
   // focused ids are passed: the runtime id and the durable stored id.
   const onFocusChange = () =>
@@ -1717,6 +1877,8 @@ function createStash(ctx) {
     // The same event is the second proof of delivery for a confirming submit:
     // `payload.running` true (or a pending prompt matching the note body).
     queue.onSessionInfo(event)
+    // A note put in the composer is sent when its own prompt appears pending.
+    composing.onSessionInfo(event)
 
     const update = titleUpdateFromEvent(event, host.state.profile.get())
 
@@ -1784,6 +1946,7 @@ function createStash(ctx) {
 
   const dispose = () => {
     queue.dispose()
+    composing.dispose()
     persistence.flush()
     // Module-scope render cache: a re-register in the same process must not
     // inherit stale titles.
@@ -1792,6 +1955,7 @@ function createStash(ctx) {
 
   return {
     $capture,
+    $composing,
     $filter,
     $imageData,
     $notes,
@@ -1838,6 +2002,8 @@ function createStash(ctx) {
     },
     dispose,
     edit: (id, patch) => {
+      // An edited note is no longer the text that went into the composer.
+      composing.clear(id)
       const before = $notes.get().find(note => note.id === id)
       const next = updateNote($notes.get(), id, patch)
 
@@ -1878,7 +2044,12 @@ function createStash(ctx) {
         return
       }
 
-      Promise.resolve(host.composer.insertText(sid, note.body, { mode: 'block' }))
+      const profile =
+        String(host.state.focusedSessionProfile.get() ?? '') ||
+        String(host.state.profile.get() ?? '') ||
+        'default'
+
+      return Promise.resolve(host.composer.insertText(sid, note.body, { mode: 'block' }))
         .then(ok => {
           if (!ok) {
             host.notify({ kind: 'error', message: t('composerFailed') })
@@ -1886,6 +2057,9 @@ function createStash(ctx) {
             return
           }
 
+          // The text is in the composer: the note is "in composer" until the
+          // user presses Enter (a matching pending prompt) or ten minutes pass.
+          composing.put({ body: note.body, noteId: note.id, profile, sid })
           host.composer.focus(sid)
         })
         .catch(() => host.notify({ kind: 'error', message: t('composerFailed') }))
@@ -1931,7 +2105,7 @@ function createStash(ctx) {
         images.push({ ...image, dataUrl })
       }
 
-      await putInComposerWithImages(
+      const ok = await putInComposerWithImages(
         { ...note, images },
         {
           dispatchPaste: dispatchImagePaste,
@@ -1942,11 +2116,28 @@ function createStash(ctx) {
           sid
         }
       )
+
+      if (!ok) {
+        return
+      }
+
+      // The text and images are in the composer: the note is "in composer"
+      // until Enter starts a turn (or ten minutes pass).
+      composing.put({
+        body: note.body,
+        noteId: note.id,
+        profile:
+          String(host.state.focusedSessionProfile.get() ?? '') ||
+          String(host.state.profile.get() ?? '') ||
+          'default',
+        sid
+      })
     },
     remove: id => {
       const note = $notes.get().find(entry => entry.id === id)
 
       queue.abandon(id)
+      composing.clear(id)
 
       if (note?.images?.length) {
         void imageStore.trash(note.images)
@@ -1978,6 +2169,10 @@ function createStash(ctx) {
 
         return
       }
+
+      // A send another way replaces the composer state: the note is sent from
+      // here, not by pressing Enter in the chat.
+      composing.clear(note.id)
 
       // Record the target chat's profile with the queued entry so a waiting row
       // can name it (`${profile}:${sid}` title lookup).
@@ -2641,11 +2836,13 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
   const focused = useValue(host.state.focusedSessionId)
   const titles = useValue($sessionTitles)
   const imageData = useValue(stash.$imageData)
+  const composing = useValue(stash.$composing)
   const focusedProfile = useValue(host.state.focusedSessionProfile)
   const primaryProfile = useValue(host.state.profile)
   const sent = note.status === 'sent'
   const queued = note.status === 'queued'
   const waiting = note.status === 'waiting'
+  const inComposer = composing.some(record => record.noteId === note.id)
   const hasImages = Boolean(note.images?.length)
   const title = deriveTitle(note, t('untitled'))
   const preview = previewFor(note)
@@ -2814,16 +3011,27 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
           }),
           jsxs('span', {
             className: 'ms-auto flex min-w-0 flex-wrap items-center justify-end gap-1',
-            children: sent && filter === 'sent'
-              ? [
-                  jsx(Badge, {
+            children: [
+              inComposer
+                ? jsx(Tip, {
+                    label: t('inComposerTip'),
+                    children: jsx(Badge, {
+                      className: 'shrink-0',
+                      size: 'xs',
+                      variant: 'muted',
+                      children: t('inComposer')
+                    })
+                  })
+                : null,
+              sent && filter === 'sent'
+                ? jsx(Badge, {
                     className: 'shrink-0',
                     size: 'xs',
                     variant: 'muted',
                     children: t('sentAgo', relativeTime(note.sentAt))
                   })
-                ]
-              : []
+                : null
+            ]
           })
         ]
       }),
@@ -2895,6 +3103,10 @@ function NotePane({ stash }) {
           jsx('div', {
             className: 'min-w-0 flex-1 truncate text-[0.8125rem] font-medium text-(--ui-text-primary)',
             children: t('paneTitle')
+          }),
+          jsx('span', {
+            className: 'shrink-0 text-[0.625rem] leading-none text-(--ui-text-tertiary)',
+            children: `v${VERSION}`
           }),
           jsx(Tip, {
             label: t('newNote'),
@@ -3041,6 +3253,8 @@ export default {
         imageMore: count => `+${count}`,
         imageRemove: 'Remove image',
         imagesDisabled: 'Images are unavailable because Note Stash is saving notes in app storage.',
+        inComposer: 'In composer',
+        inComposerTip: 'Press Enter in the chat to send. Moves to Sent when it is sent.',
         new: 'New',
         newNote: 'New note',
         noSession: 'Open a session first — there is no focused session to send to.',

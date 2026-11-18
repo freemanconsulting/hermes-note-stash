@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.2
+
+- **Put in composer** + **Enter** now moves the note to **Sent**: a note put in
+  the composer shows a muted **In composer** badge (tooltip: "Press Enter in the
+  chat to send. Moves to Sent when it is sent.") and is marked sent when the chat
+  starts a turn with that note's text (a matching pending prompt) — for an
+  images-only note, when the chat's turn starts. The badge clears silently after
+  ten minutes, on an edit or delete, on a send another way, or when another note
+  is put in the composer for the same chat. Nothing is persisted: a restart
+  leaves the note Active.
+- The plugin version is shown in the pane header (`v1.2.2`).
+
 ## 1.2.1
 
 - Fixed: Put in composer for image notes failed on a real mouse click because

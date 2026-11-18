@@ -16,6 +16,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 
 import { installStubs } from './loader.mjs'
@@ -33,7 +34,8 @@ const {
   sessionInfoConfirms,
   setNoteStatus,
   titleFromRows,
-  titleUpdateFromEvent
+  titleUpdateFromEvent,
+  VERSION
 } = await import('../desktop/plugin.js')
 const plugin = (await import('../desktop/plugin.js')).default
 const sdk = await import('@hermes/plugin-sdk')
@@ -783,21 +785,26 @@ describe('send queue', () => {
 })
 
 /** Register the real plugin against a fake ctx and return the stash handle. */
-function registerStash({ submit, setInterval: setIntervalOverride, setTimeout: setTimeoutOverride }) {
+function registerStash({ files, submit, setInterval: setIntervalOverride, setTimeout: setTimeoutOverride }) {
   const contributions = []
   const disposers = []
+  const events = {}
   const storage = new Map()
 
   sdk.host.composer.submit = submit
 
   const ctx = {
-    files: undefined, // force the ctx.storage persistence path
+    files: files ?? undefined, // default: force the ctx.storage persistence path
     i18n: {
       register: () => {},
       t: key => String(key)
     },
     onDispose: disposer => disposers.push(disposer),
-    onEvent: () => () => {},
+    onEvent: (type, handler) => {
+      events[type] = handler
+
+      return () => {}
+    },
     register: contribution => contributions.push(contribution),
     setInterval: setIntervalOverride ?? (() => () => {}),
     // Default: fire immediately, so the queue's settle delay runs synchronously.
@@ -818,7 +825,7 @@ function registerStash({ submit, setInterval: setIntervalOverride, setTimeout: s
 
   const pane = contributions.find(contribution => contribution.id === 'pane')
 
-  return { disposers, stash: pane.render().props.stash }
+  return { disposers, events, stash: pane.render().props.stash }
 }
 
 /** ctx.setTimeout/setInterval backed by the fake clock, as callable handles. */
@@ -1015,6 +1022,196 @@ describe('app send paths', () => {
     for (const disposer of disposers) {
       disposer()
     }
+  })
+})
+
+describe('put in composer', () => {
+  /** A stash whose text insert succeeds and whose session.info handler is captured. */
+  function composingStash(timers, extra = {}) {
+    sdk.host.notify = () => {}
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.focusedStoredSessionId.set(null)
+    sdk.host.state.busyBySession.set({})
+    sdk.host.composer.insertText = async () => true
+
+    return registerStash({ submit: () => true, ...fakeCtxTimers(timers), ...extra })
+  }
+
+  it('moves a prefixed note to Sent once when its own prompt is pending', async () => {
+    const timers = fakeTimers()
+    const { disposers, events, stash } = composingStash(timers)
+    const body = 'Refactor the send queue so a note is only sent after the chat starts a turn'
+    const note = stash.addNote({ body, title: 'Queue' })
+
+    await stash.putInComposer(note)
+
+    assert.equal(stash.$notes.get()[0].status, 'active', 'Put in composer alone does not send')
+    assert.deepEqual(stash.$composing.get().map(record => record.noteId), [note.id])
+    assert.equal(stash.$composing.get()[0].sid, 'sess-1')
+    assert.equal(stash.$composing.get()[0].prefix, body.slice(0, 40))
+
+    events['session.info']({
+      session_id: 'sess-1',
+      payload: { pending: [{ text: `${body} and more` }] }
+    })
+
+    assert.equal(stash.$notes.get()[0].status, 'sent')
+    assert.equal(stash.$notes.get()[0].sentTo, 'sess-1')
+    assert.deepEqual(stash.$composing.get(), [], 'the record is cleared')
+
+    const sentAt = stash.$notes.get()[0].sentAt
+
+    events['session.info']({
+      session_id: 'sess-1',
+      payload: { pending: [{ text: body }] }
+    })
+
+    assert.equal(stash.$notes.get()[0].sentAt, sentAt, 'a second matching event does not re-send')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('leaves a prefixed note active when the pending prompt or a busy flip does not match', async () => {
+    const timers = fakeTimers()
+    const { disposers, events, stash } = composingStash(timers)
+    const note = stash.addNote({ body: 'the exact prompt text', title: 'Prompt' })
+
+    await stash.putInComposer(note)
+
+    events['session.info']({
+      session_id: 'sess-1',
+      payload: { pending: [{ text: 'a different prompt' }] }
+    })
+
+    assert.equal(stash.$notes.get()[0].status, 'active', 'a non-matching prompt is not proof')
+    assert.equal(stash.$composing.get().length, 1)
+
+    sdk.host.state.busyBySession.set({ 'sess-1': true })
+
+    assert.equal(stash.$notes.get()[0].status, 'active', 'a busy flip alone does not confirm a prefixed note')
+    assert.equal(stash.$composing.get().length, 1)
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('moves an images-only note to Sent once when the chat starts a turn', async () => {
+    const timers = fakeTimers()
+    const files = {
+      dataFolder: 'data',
+      list: async () => ({ files: [], ok: true }),
+      readText: async () => ({ ok: true, text: 'data:image/png;base64,iVBORw0KGgo=' }),
+      stat: async () => ({ ok: true }),
+      trash: async () => ({ ok: true }),
+      writeText: async () => ({ ok: true })
+    }
+    const { disposers, stash } = composingStash(timers, { files })
+    const note = stash.addNote({
+      images: [{ bytes: 8, file: 'img-note-img-0.txt', h: 2, mime: 'image/png', w: 3 }],
+      title: 'Images only'
+    })
+
+    // Desktop's paste path needs the browser globals dispatchImagePaste uses.
+    const original = {
+      ClipboardEvent: globalThis.ClipboardEvent,
+      DataTransfer: globalThis.DataTransfer,
+      window: globalThis.window
+    }
+
+    globalThis.DataTransfer = class {
+      constructor() {
+        this.items = { add: () => {} }
+      }
+    }
+    globalThis.ClipboardEvent = class {
+      constructor() {
+        this.defaultPrevented = true
+      }
+    }
+    globalThis.window = { dispatchEvent: () => {} }
+
+    try {
+      await stash.putInComposerImages(note)
+
+      assert.equal(stash.$notes.get()[0].status, 'active')
+      assert.equal(stash.$composing.get()[0].prefix, '', 'an images-only note has no text prefix')
+
+      sdk.host.state.busyBySession.set({ 'sess-1': true })
+
+      assert.equal(stash.$notes.get()[0].status, 'sent')
+      assert.equal(stash.$notes.get()[0].sentTo, 'sess-1')
+      assert.deepEqual(stash.$composing.get(), [])
+
+      const sentAt = stash.$notes.get()[0].sentAt
+
+      sdk.host.state.busyBySession.set({})
+      sdk.host.state.busyBySession.set({ 'sess-1': true })
+
+      assert.equal(stash.$notes.get()[0].sentAt, sentAt, 'a later turn does not re-send')
+    } finally {
+      globalThis.ClipboardEvent = original.ClipboardEvent
+      globalThis.DataTransfer = original.DataTransfer
+      globalThis.window = original.window
+    }
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('clears the composing record silently after ten minutes', async () => {
+    const timers = fakeTimers()
+    const notifications = []
+    const { disposers, stash } = composingStash(timers)
+    const note = stash.addNote({ body: 'timeout note', title: 'Timeout' })
+
+    sdk.host.notify = notification => notifications.push(notification)
+
+    await stash.putInComposer(note)
+
+    assert.equal(stash.$composing.get().length, 1)
+    assert.ok(timers.pendingMs().includes(600000), 'the ten-minute timer is armed')
+
+    timers.run()
+
+    assert.deepEqual(stash.$composing.get(), [])
+    assert.equal(stash.$notes.get()[0].status, 'active', 'the note stays Active')
+    assert.deepEqual(notifications, [], 'the timeout is silent')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('replaces the record when another note is put in the composer for the same chat', async () => {
+    const timers = fakeTimers()
+    const { disposers, stash } = composingStash(timers)
+    const first = stash.addNote({ body: 'first note', title: 'First' })
+    const second = stash.addNote({ body: 'second note', title: 'Second' })
+
+    await stash.putInComposer(first)
+    await stash.putInComposer(second)
+
+    assert.deepEqual(stash.$composing.get().map(record => record.noteId), [second.id])
+    assert.equal(stash.$notes.get().find(note => note.id === first.id).status, 'active')
+    assert.equal(stash.$notes.get().find(note => note.id === second.id).status, 'active')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+})
+
+describe('version', () => {
+  it('matches plugin.yaml and package.json', async () => {
+    const yaml = await readFile(new URL('../plugin.yaml', import.meta.url), 'utf8')
+    const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+
+    assert.equal(VERSION, pkg.version)
+    assert.match(yaml, new RegExp(`^version: "${VERSION}"$`, 'm'))
   })
 })
 
