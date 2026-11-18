@@ -1,0 +1,15 @@
+name: note-stash
+version: "1.1.0"
+requires_hermes: ">=0.22.7"   # ctx.files first ships in v0.22.7; all other SDK symbols exist from v0.22.0
+description: "Sticky notes and a code stash for Hermes Desktop: capture a thought without interrupting the current turn, then send a note to the focused session as the next prompt, queued until a running turn ends."
+author: freemanconsulting
+license: MIT
+homepage: https://github.com/freemanconsulting/hermes-note-stash
+tags: [desktop, notes, composer, prompts]
+# Desktop-only package: the UI lives in desktop/plugin.js and registers nothing
+# on the agent side (no tools, hooks, middleware or env vars).
+provides_tools: []
+provides_hooks: []
+capabilities: []
+requires_env: []
+python_dependencies: []
