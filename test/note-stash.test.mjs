@@ -27,6 +27,7 @@ const {
   createSendQueue,
   parseNotesFile,
   previewFor,
+  sessionInfoConfirms,
   titleFromRows,
   titleUpdateFromEvent
 } = await import('../desktop/plugin.js')
@@ -117,6 +118,46 @@ describe('previewFor', () => {
   })
 })
 
+describe('sessionInfoConfirms', () => {
+  // submit() returning true is not proof of delivery: this is the second proof.
+  const body = 'Refactor the send queue so a note is only sent after the chat starts a turn'
+
+  it('confirms when the event is for the session and the turn is running', () => {
+    assert.equal(
+      sessionInfoConfirms({ session_id: 's1', type: 'session.info', payload: { running: true } }, 's1', body),
+      true
+    )
+    assert.equal(
+      sessionInfoConfirms({ payload: { running: true, stored_session_id: 's1' } }, 's1', body),
+      true
+    )
+  })
+
+  it('confirms when a pending prompt starts with the first 40 chars of the body', () => {
+    const prefix = body.slice(0, 40)
+
+    assert.equal(
+      sessionInfoConfirms({ session_id: 's1', payload: { pending: [{ text: `${prefix} and more` }] } }, 's1', body),
+      true
+    )
+    assert.equal(
+      sessionInfoConfirms({ session_id: 's1', payload: { pending: [`${prefix} and more`] } }, 's1', body),
+      true
+    )
+  })
+
+  it('does not confirm for another session, a false running flag, or an unrelated pending prompt', () => {
+    assert.equal(sessionInfoConfirms({ session_id: 's2', payload: { running: true } }, 's1', body), false)
+    assert.equal(sessionInfoConfirms({ session_id: 's1', payload: { running: false } }, 's1', body), false)
+    assert.equal(
+      sessionInfoConfirms({ session_id: 's1', payload: { pending: [{ text: 'something else' }] } }, 's1', body),
+      false
+    )
+    assert.equal(sessionInfoConfirms({ session_id: 's1', payload: { pending: [{ text: 'x' }] } }, 's1', ''), false)
+    assert.equal(sessionInfoConfirms(null, 's1', body), false)
+  })
+})
+
 /** Deterministic timers: nothing fires until `run()` / `tick()`. */
 function fakeTimers() {
   let nextId = 1
@@ -128,6 +169,7 @@ function fakeTimers() {
     clearTimeoutFn: id => timers.delete(id),
     intervals: () => intervals.size,
     pending: () => timers.size,
+    pendingMs: () => [...timers.values()].map(entry => entry.ms),
     run: () => {
       const armed = [...timers.values()]
       timers.clear()
@@ -159,7 +201,7 @@ function fakeTimers() {
 }
 
 describe('send queue', () => {
-  it('never submits into a busy session, then submits once after idle + settle', () => {
+  it('never submits into a busy session, then submits once after idle + settle and marks sent only when the turn starts', () => {
     const submitted = []
     const events = []
     const timers = fakeTimers()
@@ -192,18 +234,32 @@ describe('send queue', () => {
     timers.run()
 
     assert.deepEqual(submitted, [['s1', 'first']])
+    assert.deepEqual(events, [], 'submit returning true alone must not mark sent')
+    assert.deepEqual(timers.pendingMs(), [8000], 'the delivery confirmation is armed for 8 s')
+
+    // A fast turn still flips busy true momentarily: that flip is the proof.
+    busy = { s1: true }
+    queue.onBusyChange(busy)
+
     assert.deepEqual(events, [{ noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' }])
     assert.equal(queue.pending('s1'), 0)
+    assert.equal(timers.pending(), 0, 'confirming cancels its own timeout')
+
+    queue.onBusyChange({ s1: true })
+
+    assert.equal(events.length, 1, 'sent is emitted exactly once')
   })
 
-  it('keeps FIFO order: the second note waits for the second idle transition', () => {
+  it('keeps FIFO order: the second note waits for the second idle transition, each confirmed by its turn', () => {
     const submitted = []
+    const events = []
     const timers = fakeTimers()
     let busy = { s1: true }
 
     const queue = createSendQueue({
       clearTimeoutFn: timers.clearTimeoutFn,
       isBusy: sid => Boolean(busy[sid]),
+      onEvent: event => events.push(event),
       setTimeoutFn: timers.setTimeoutFn,
       submit: (sid, body) => {
         submitted.push(body)
@@ -222,12 +278,15 @@ describe('send queue', () => {
 
     assert.deepEqual(submitted, ['one'], 'only the head note goes on the first idle transition')
 
+    busy = { s1: true }
+    queue.onBusyChange(busy)
+
+    assert.deepEqual(events.map(event => event.type), ['sent'], 'the first note is confirmed by its turn')
+
     timers.run()
 
     assert.deepEqual(submitted, ['one'], 'the second note must not ride the same transition')
 
-    busy = { s1: true }
-    queue.onBusyChange(busy)
     busy = { s1: false }
     queue.onBusyChange(busy)
 
@@ -236,6 +295,11 @@ describe('send queue', () => {
     timers.run()
 
     assert.deepEqual(submitted, ['one', 'two'])
+
+    busy = { s1: true }
+    queue.onBusyChange(busy)
+
+    assert.deepEqual(events.map(event => event.type), ['sent', 'sent'])
     assert.equal(queue.pending('s1'), 0)
   })
 
@@ -268,7 +332,7 @@ describe('send queue', () => {
     assert.equal(timers.intervals(), 1, 'the retry interval runs while a note waits')
   })
 
-  it('sends a waiting note once on a retry, then the next note waits for the next idle transition', () => {
+  it('sends a waiting note once on a retry after the 1.5 s focus settle, then the next note waits for the next idle transition', () => {
     const submitted = []
     const events = []
     const timers = fakeTimers()
@@ -297,28 +361,190 @@ describe('send queue', () => {
     assert.equal(queue.pending('s1'), 2)
 
     ok = true
-    queue.onFocusChange()
+    queue.onFocusChange(['s1'])
+
+    assert.deepEqual(submitted, ['one'], 'a just-opened chat is not retried immediately')
+    assert.deepEqual(timers.pendingMs(), [1500], 'the retry is scheduled 1.5 s out')
+
+    timers.run()
 
     assert.deepEqual(submitted, ['one', 'one'], 'the retry submits the waiting head')
     assert.deepEqual(events, [
-      { noteId: 'n1', profile: 'default', sid: 's1', type: 'waiting' },
-      { noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' }
-    ])
-    assert.equal(queue.pending('s1'), 1, 'the sent note leaves the queue exactly once')
-    assert.equal(timers.intervals(), 0, 'the retry interval stops when nothing waits')
-
-    queue.onFocusChange()
-
-    assert.deepEqual(submitted, ['one', 'one'], 'the second note must not ride the same retry')
+      { noteId: 'n1', profile: 'default', sid: 's1', type: 'waiting' }
+    ], 'submit true alone does not mark sent')
 
     busy = { s1: true }
     queue.onBusyChange(busy)
+
+    assert.deepEqual(events.at(-1), { noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' })
+    assert.equal(queue.pending('s1'), 1, 'the sent note leaves the queue exactly once')
+    assert.equal(timers.intervals(), 0, 'the retry interval stops when nothing waits')
+
+    queue.onFocusChange(['s1'])
+
+    assert.deepEqual(submitted, ['one', 'one'], 'the second note must not ride the same retry')
+
     busy = { s1: false }
     queue.onBusyChange(busy)
+
+    assert.deepEqual(submitted, ['one', 'one'], 'the next note waits for the next idle transition')
+
     timers.run()
 
     assert.deepEqual(submitted, ['one', 'one', 'two'], 'the next note waits for the next idle transition')
+
+    busy = { s1: true }
+    queue.onBusyChange(busy)
+
     assert.equal(queue.pending('s1'), 0)
+  })
+
+  it('leaves the entry waiting when submit returns true but the session never starts a turn within 8 s', () => {
+    const events = []
+    const timers = fakeTimers()
+
+    const queue = createSendQueue({
+      clearIntervalFn: timers.clearIntervalFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: () => false,
+      onEvent: event => events.push(event),
+      setIntervalFn: timers.setIntervalFn,
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: () => true
+    })
+
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    timers.run()
+
+    assert.deepEqual(events, [], 'submit true alone must not mark sent')
+    assert.deepEqual(timers.pendingMs(), [8000])
+
+    timers.run()
+
+    assert.deepEqual(events, [{ noteId: 'n1', profile: 'default', sid: 's1', type: 'waiting' }])
+    assert.equal(events.some(event => event.type === 'sent'), false, 'an unconfirmed submit is never sent')
+    assert.equal(queue.pending('s1'), 1, 'the note stays at the head of the FIFO')
+  })
+
+  it('marks sent exactly once when the busy map flips true after a submit', () => {
+    const events = []
+    const timers = fakeTimers()
+
+    const queue = createSendQueue({
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: () => false,
+      onEvent: event => events.push(event),
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: () => true
+    })
+
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    timers.run()
+
+    queue.onBusyChange({ s1: true })
+    queue.onBusyChange({ s1: true })
+    queue.onBusyChange({})
+
+    assert.deepEqual(events, [{ noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' }])
+    assert.equal(queue.pending('s1'), 0)
+  })
+
+  it('marks sent exactly once when session.info reports the turn running', () => {
+    const events = []
+    const timers = fakeTimers()
+
+    const queue = createSendQueue({
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: () => false,
+      onEvent: event => events.push(event),
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: () => true
+    })
+
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    timers.run()
+
+    queue.onSessionInfo({ session_id: 's1', type: 'session.info', payload: { running: true } })
+    queue.onSessionInfo({ session_id: 's1', type: 'session.info', payload: { running: true } })
+
+    assert.deepEqual(events, [{ noteId: 'n1', profile: 'default', sid: 's1', type: 'sent' }])
+    assert.equal(queue.pending('s1'), 0)
+  })
+
+  it('does not submit again from any retry trigger while an entry is confirming', () => {
+    const submitted = []
+    const timers = fakeTimers()
+
+    const queue = createSendQueue({
+      clearIntervalFn: timers.clearIntervalFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: () => false,
+      setIntervalFn: timers.setIntervalFn,
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return true
+      }
+    })
+
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    timers.run()
+
+    assert.deepEqual(submitted, ['x'])
+
+    queue.onFocusChange(['s1'])
+    queue.onBusyChange({})
+    timers.tick()
+
+    assert.deepEqual(submitted, ['x'], 'no retry may submit a confirming entry again')
+    assert.equal(timers.pending(), 1, 'only the confirmation timeout is armed')
+
+    // Unconfirmed after 8 s: back to waiting, and only then may a retry submit.
+    timers.run()
+
+    queue.onFocusChange(['s1'])
+    timers.run()
+
+    assert.deepEqual(submitted, ['x', 'x'], 'a retry after the timeout submits again')
+  })
+
+  it('schedules the retry 1.5 s after focus moves to the target, and cancels it when focus moves away', () => {
+    const submitted = []
+    const timers = fakeTimers()
+
+    const queue = createSendQueue({
+      clearIntervalFn: timers.clearIntervalFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      isBusy: () => false,
+      setIntervalFn: timers.setIntervalFn,
+      setTimeoutFn: timers.setTimeoutFn,
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return false
+      }
+    })
+
+    queue.enqueue({ body: 'x', id: 'n1' }, 's1', 'default')
+    timers.run()
+
+    assert.deepEqual(submitted, ['x'])
+
+    queue.onFocusChange(['s1'])
+
+    assert.deepEqual(submitted, ['x'], 'focus alone must not retry immediately')
+    assert.deepEqual(timers.pendingMs(), [1500])
+
+    queue.onFocusChange(['other'])
+
+    assert.deepEqual(timers.pendingMs(), [], 'focus moving away cancels the retry')
+    assert.deepEqual(submitted, ['x'])
+
+    queue.onFocusChange(['s1'])
+    timers.run()
+
+    assert.deepEqual(submitted, ['x', 'x'], 'the retry fires after the 1.5 s settle')
   })
 
   it('cancels a waiting note back to active and never submits it again', () => {
@@ -363,7 +589,7 @@ describe('send queue', () => {
 })
 
 /** Register the real plugin against a fake ctx and return the stash handle. */
-function registerStash({ submit }) {
+function registerStash({ submit, setInterval: setIntervalOverride, setTimeout: setTimeoutOverride }) {
   const contributions = []
   const disposers = []
   const storage = new Map()
@@ -379,13 +605,15 @@ function registerStash({ submit }) {
     onDispose: disposer => disposers.push(disposer),
     onEvent: () => () => {},
     register: contribution => contributions.push(contribution),
-    setInterval: () => () => {},
-    // Fire immediately: the queue's settle delay then runs synchronously.
-    setTimeout: fn => {
-      fn()
+    setInterval: setIntervalOverride ?? (() => () => {}),
+    // Default: fire immediately, so the queue's settle delay runs synchronously.
+    setTimeout:
+      setTimeoutOverride ??
+      (fn => {
+        fn()
 
-      return () => {}
-    },
+        return () => {}
+      }),
     storage: {
       get: (key, fallback) => (storage.has(key) ? storage.get(key) : fallback),
       set: (key, value) => storage.set(key, value)
@@ -397,6 +625,22 @@ function registerStash({ submit }) {
   const pane = contributions.find(contribution => contribution.id === 'pane')
 
   return { disposers, stash: pane.render().props.stash }
+}
+
+/** ctx.setTimeout/setInterval backed by the fake clock, as callable handles. */
+function fakeCtxTimers(timers) {
+  return {
+    setInterval: (fn, ms) => {
+      const id = timers.setIntervalFn(fn, ms)
+
+      return () => timers.clearIntervalFn(id)
+    },
+    setTimeout: (fn, ms) => {
+      const id = timers.setTimeoutFn(fn, ms)
+
+      return () => timers.clearTimeoutFn(id)
+    }
+  }
 }
 
 describe('app send paths', () => {
@@ -420,12 +664,14 @@ describe('app send paths', () => {
     }
   })
 
-  it('marks a queued note waiting when its chat is off screen, then sends it on a focus change', () => {
+  it('marks a queued note waiting when its chat is off screen, then sends it once its chat starts a turn', () => {
     const notifications = []
     const submitted = []
+    const timers = fakeTimers()
     let ok = false
     sdk.host.notify = notification => notifications.push(notification)
     sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.focusedStoredSessionId.set(null)
     sdk.host.state.busyBySession.set({})
 
     const { disposers, stash } = registerStash({
@@ -433,7 +679,8 @@ describe('app send paths', () => {
         submitted.push(body)
 
         return ok
-      }
+      },
+      ...fakeCtxTimers(timers)
     })
     const note = stash.addNote({ body: 'later', title: 'Later' })
 
@@ -444,6 +691,7 @@ describe('app send paths', () => {
 
     // Turn ends while the user is on another chat: submit is fail-closed.
     sdk.host.state.busyBySession.set({})
+    timers.run()
 
     assert.equal(stash.$notes.get()[0].status, 'waiting')
     assert.equal(stash.$notes.get()[0].sid, 'sess-1', 'the target chat is recorded')
@@ -451,10 +699,83 @@ describe('app send paths', () => {
     assert.deepEqual(notifications, [], 'waiting is silent')
 
     ok = true
-    sdk.host.state.focusedSessionId.set('sess-2')
+    sdk.host.state.focusedSessionId.set('sess-1')
+
+    assert.deepEqual(submitted, ['later'], 'a just-opened chat is not retried immediately')
+    assert.deepEqual(timers.pendingMs().filter(ms => ms > 750), [1500], 'the retry is scheduled 1.5 s out')
+    assert.equal(stash.$notes.get()[0].status, 'waiting', 'the row keeps showing Waiting')
+
+    timers.run()
+
+    assert.deepEqual(submitted, ['later', 'later'])
+    assert.equal(stash.$notes.get()[0].status, 'waiting', 'submit true alone must not mark sent')
+    assert.deepEqual(notifications, [], 'an unconfirmed submit is silent')
+
+    // The chat starts its turn: that is the proof of delivery.
+    sdk.host.state.busyBySession.set({ 'sess-1': true })
 
     assert.equal(stash.$notes.get()[0].status, 'sent', 'the retry sends it once')
-    assert.deepEqual(submitted, ['later', 'later'])
+    assert.equal(stash.$notes.get()[0].sentTo, 'sess-1')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('returns an unconfirmed queued submit to waiting after 8 s, with no error', () => {
+    const notifications = []
+    const timers = fakeTimers()
+    sdk.host.notify = notification => notifications.push(notification)
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.busyBySession.set({})
+
+    const { disposers, stash } = registerStash({
+      submit: () => true,
+      ...fakeCtxTimers(timers)
+    })
+    const note = stash.addNote({ body: 'later', title: 'Later' })
+
+    sdk.host.state.busyBySession.set({ 'sess-1': true })
+    stash.send(note)
+    sdk.host.state.busyBySession.set({})
+    timers.run()
+
+    assert.equal(stash.$notes.get()[0].status, 'queued', 'the row keeps showing Queued while confirming')
+
+    timers.run()
+
+    assert.equal(stash.$notes.get()[0].status, 'waiting', 'the submit did not reach the session')
+    assert.equal(stash.$notes.get()[0].status === 'sent', false)
+    assert.deepEqual(notifications, [], 'a waiting note is silent')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+
+  it('reports failure and leaves the note active when an immediate submit is never confirmed', () => {
+    const notifications = []
+    const timers = fakeTimers()
+    sdk.host.notify = notification => notifications.push(notification)
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.busyBySession.set({})
+
+    const { disposers, stash } = registerStash({
+      submit: () => true,
+      ...fakeCtxTimers(timers)
+    })
+    const note = stash.addNote({ body: 'manual', title: 'Manual' })
+
+    stash.send(note)
+
+    assert.equal(stash.$notes.get()[0].status, 'active', 'submit true alone must not mark sent')
+    assert.deepEqual(timers.pendingMs().filter(ms => ms > 750), [8000])
+
+    timers.run()
+
+    assert.equal(stash.$notes.get()[0].status, 'active', 'the note returns to Active')
+    assert.equal(notifications.length, 1, 'the silent drop is visible on the manual path')
+    assert.equal(notifications[0].message, 'sendFailed')
 
     for (const disposer of disposers) {
       disposer()
@@ -463,6 +784,7 @@ describe('app send paths', () => {
 
   it('cancels a waiting note back to active and stops retrying it', () => {
     const submitted = []
+    const timers = fakeTimers()
     sdk.host.notify = () => {}
     sdk.host.state.focusedSessionId.set('sess-1')
     sdk.host.state.busyBySession.set({})
@@ -472,13 +794,15 @@ describe('app send paths', () => {
         submitted.push(body)
 
         return false
-      }
+      },
+      ...fakeCtxTimers(timers)
     })
     const note = stash.addNote({ body: 'later', title: 'Later' })
 
     sdk.host.state.busyBySession.set({ 'sess-1': true })
     stash.send(note)
     sdk.host.state.busyBySession.set({})
+    timers.run()
 
     assert.equal(stash.$notes.get()[0].status, 'waiting')
 
@@ -490,6 +814,7 @@ describe('app send paths', () => {
     const attempts = submitted.length
     sdk.host.state.focusedSessionId.set('sess-2')
     sdk.host.state.busyBySession.set({})
+    timers.run()
 
     assert.equal(submitted.length, attempts, 'no submit attempt after the cancel')
 

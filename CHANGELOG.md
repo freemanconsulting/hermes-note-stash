@@ -7,6 +7,10 @@
   badge, a muted line naming the chat, and **Cancel**; it retries on a focus
   change, a busy change, or a 3 s interval that runs only while a note waits.
   The immediate, not-busy Send path still reports a real submit failure.
+- A note is now marked sent only after its chat actually starts the turn (a
+  submit that returns true but never reaches the session goes back to Waiting
+  silently), and a just-opened chat gets ~1.5 s to settle before a waiting note
+  is sent.
 
 ## 1.1.0 — first public release
 

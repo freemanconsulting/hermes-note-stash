@@ -56,6 +56,9 @@ const NOTES_VERSION = 1
 const WRITE_DEBOUNCE_MS = 300
 const SEND_SETTLE_MS = 750
 const WAIT_RETRY_MS = 3000
+const CONFIRM_MS = 8000
+const FOCUS_SETTLE_MS = 1500
+const CONFIRM_PREFIX_LENGTH = 40
 const TITLE_LENGTH = 72
 const LABEL_TITLE_LENGTH = 32
 const KEYBIND_ID = 'note-stash.new-note'
@@ -378,6 +381,58 @@ export function filterNotes(notes, { filter = 'active', search = '' } = {}) {
 }
 
 /**
+ * Whether a `session.info` event proves the session actually started a turn for
+ * this note. `host.composer.submit()` returning true only means a visible
+ * composer surface existed — the composer's own listener silently drops the
+ * event while the chat is still hydrating, so a submit's word is not proof.
+ * Confirmed when the event is for `sid` and either `payload.running` is true or
+ * a `payload.pending` entry's text starts with the first 40 chars of the body.
+ */
+export function sessionInfoConfirms(ev, sid, body) {
+  if (!ev || typeof ev !== 'object' || typeof sid !== 'string' || !sid) {
+    return false
+  }
+
+  const payload = ev.payload && typeof ev.payload === 'object' ? ev.payload : {}
+  const ids = [payload.stored_session_id, payload.session_id, ev.session_id, ev.stored_session_id]
+    .filter(id => typeof id === 'string' && id.trim())
+    .map(id => id.trim())
+
+  if (!ids.includes(sid)) {
+    return false
+  }
+
+  if (payload.running === true) {
+    return true
+  }
+
+  const prefix = typeof body === 'string' ? body.slice(0, CONFIRM_PREFIX_LENGTH) : ''
+
+  if (!prefix.trim()) {
+    return false
+  }
+
+  const pending = Array.isArray(payload.pending) ? payload.pending : []
+
+  for (const entry of pending) {
+    const text =
+      typeof entry === 'string'
+        ? entry
+        : typeof entry?.text === 'string'
+          ? entry.text
+          : typeof entry?.body === 'string'
+            ? entry.body
+            : ''
+
+    if (text && text.startsWith(prefix)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+/**
  * The send-queue state machine. Per-session FIFO; one note per idle transition.
  *
  * Phases per session:
@@ -390,10 +445,15 @@ export function filterNotes(notes, { filter = 'active', search = '' } = {}) {
  *                  (host.composer.submit is fail-closed); the head note stays
  *                  queued in place and is retried on a focus change, a busy
  *                  change, or a 3 s interval that only runs while one waits.
+ *  - `confirming`  submit returned true but that is not proof of delivery: the
+ *                  head note stays in place until the session proves it started
+ *                  a turn (busy flip or `session.info`), then it is sent; after
+ *                  8 s unconfirmed it goes back to `waiting`. No retry submits
+ *                  while an entry is confirming.
  *
  * Injected: `submit(sid, body) → boolean`, `isBusy(sid) → boolean`, timers,
- * clock, and `onEvent` (`sent` / `waiting` / `cancelled`). No globals, no host
- * access — the app layer wires those in.
+ * clock, and `onEvent` (`sent` / `waiting` / `failed` / `cancelled`). No globals,
+ * no host access — the app layer wires those in.
  */
 export function createSendQueue({
   submit,
@@ -404,16 +464,27 @@ export function createSendQueue({
   clearIntervalFn = handle => globalThis.clearInterval(handle),
   settleMs = SEND_SETTLE_MS,
   waitRetryMs = WAIT_RETRY_MS,
+  confirmMs = CONFIRM_MS,
+  focusSettleMs = FOCUS_SETTLE_MS,
   onEvent = () => {}
 }) {
   const sessions = new Map()
+  const manual = new Map()
   let waitTimer = null
 
   const record = sid => {
     let entry = sessions.get(sid)
 
     if (!entry) {
-      entry = { items: [], phase: 'idle', sawBusy: false, timer: null }
+      entry = {
+        confirmItem: null,
+        confirmTimer: null,
+        items: [],
+        phase: 'idle',
+        sawBusy: false,
+        settleTimer: null,
+        timer: null
+      }
       sessions.set(sid, entry)
     }
 
@@ -427,6 +498,27 @@ export function createSendQueue({
     }
   }
 
+  /** The focus-settle timer: a just-opened chat gets 1.5 s before a retry. */
+  const clearSettle = entry => {
+    if (entry.settleTimer !== null) {
+      clearTimeoutFn(entry.settleTimer)
+      entry.settleTimer = null
+    }
+  }
+
+  const clearConfirm = entry => {
+    if (entry.confirmTimer !== null) {
+      clearTimeoutFn(entry.confirmTimer)
+      entry.confirmTimer = null
+    }
+  }
+
+  const clearTimers = entry => {
+    clearTimer(entry)
+    clearSettle(entry)
+    clearConfirm(entry)
+  }
+
   /** One submit attempt. A throw is a false result, never a crash. */
   const submitItem = item => {
     try {
@@ -437,9 +529,75 @@ export function createSendQueue({
   }
 
   /**
-   * Retry every waiting head whose session is idle. A success is the same
-   * bookkeeping as a normal submit: shift the head, arm `awaitingTurn` so the
-   * next queued note waits for the next idle transition, and emit `sent` once.
+   * The session proved it started the turn: mark sent exactly once. The busy
+   * flip (or `running` session.info) IS the turn's start, so `sawBusy` is set —
+   * the next queued note then waits for that turn to end.
+   */
+  const finishConfirm = (entry, sid) => {
+    const item = entry.confirmItem
+
+    if (!item) {
+      return false
+    }
+
+    clearConfirm(entry)
+    entry.confirmItem = null
+
+    if (entry.items[0] === item) {
+      entry.items.shift()
+    }
+
+    entry.phase = 'awaitingTurn'
+    entry.sawBusy = true
+    onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'sent' })
+
+    return true
+  }
+
+  /**
+   * submit() returned true, but that only means a visible composer surface
+   * existed — the composer's own listener silently drops the event while the
+   * chat is still hydrating. Hold the note at the head of the FIFO in
+   * `confirming` (the row keeps showing Queued/Waiting) until the session proves
+   * a turn started, or 8 s pass and it goes back to `waiting` silently.
+   */
+  const beginConfirm = (entry, item, sid) => {
+    entry.phase = 'confirming'
+    entry.confirmItem = item
+    entry.confirmTimer = setTimeoutFn(() => {
+      entry.confirmTimer = null
+
+      if (entry.phase !== 'confirming' || entry.confirmItem !== item) {
+        return
+      }
+
+      entry.confirmItem = null
+      entry.phase = 'waiting'
+      onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'waiting' })
+      syncWaitTimer()
+    }, confirmMs)
+  }
+
+  /** The manual path's confirmation: same proof, but a timeout is a real error. */
+  const finishManual = (noteId, record) => {
+    if (manual.get(noteId) !== record) {
+      return false
+    }
+
+    if (record.timer !== null) {
+      clearTimeoutFn(record.timer)
+      record.timer = null
+    }
+
+    manual.delete(noteId)
+    onEvent({ noteId, profile: record.item.profile, sid: record.item.sid, type: 'sent' })
+
+    return true
+  }
+
+  /**
+   * Retry every waiting head whose session is idle. A success only starts a
+   * confirmation — the note is not sent until the session proves a turn started.
    * A failure stays waiting silently.
    */
   const retryWaiting = onlySid => {
@@ -460,14 +618,14 @@ export function createSendQueue({
         continue
       }
 
+      // A retry supersedes any pending focus-settle timer for this session.
+      clearSettle(entry)
+
       if (!submitItem(item)) {
         continue
       }
 
-      entry.items.shift()
-      entry.phase = 'awaitingTurn'
-      entry.sawBusy = false
-      onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'sent' })
+      beginConfirm(entry, item, sid)
     }
 
     syncWaitTimer()
@@ -508,7 +666,12 @@ export function createSendQueue({
       return
     }
 
-    if (entry.phase === 'settling' || entry.phase === 'awaitingTurn' || entry.phase === 'waiting') {
+    if (
+      entry.phase === 'settling' ||
+      entry.phase === 'awaitingTurn' ||
+      entry.phase === 'waiting' ||
+      entry.phase === 'confirming'
+    ) {
       return
     }
 
@@ -551,10 +714,7 @@ export function createSendQueue({
         return
       }
 
-      entry.items.shift()
-      entry.phase = 'awaitingTurn'
-      entry.sawBusy = false
-      onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'sent' })
+      beginConfirm(entry, item, sid)
     }, settleMs)
   }
 
@@ -575,13 +735,87 @@ export function createSendQueue({
     return true
   }
 
+  /**
+   * The immediate, not-busy Send path: submit once, then confirm the same way
+   * the queue does. `true` is not proof of delivery, so the note stays Active
+   * until the session proves a turn started; an unconfirmed submit after 8 s is
+   * a real error (the user is looking at that chat) and reports `failed`.
+   * Returns `'failed'` or `'confirming'`.
+   */
+  const sendNow = (note, sid, profile) => {
+    if (!sid || !note || !note.id) {
+      return 'failed'
+    }
+
+    const item = {
+      body: typeof note.body === 'string' ? note.body : '',
+      noteId: note.id,
+      profile: typeof profile === 'string' && profile ? profile : 'default',
+      sid
+    }
+
+    if (!submitItem(item)) {
+      return 'failed'
+    }
+
+    const record = { item, sid, timer: null }
+    manual.set(note.id, record)
+    record.timer = setTimeoutFn(() => {
+      record.timer = null
+
+      if (manual.get(note.id) !== record) {
+        return
+      }
+
+      manual.delete(note.id)
+      onEvent({ noteId: note.id, profile: item.profile, sid, type: 'failed' })
+    }, confirmMs)
+
+    return 'confirming'
+  }
+
+  /** Whether a manual submit for this note is awaiting delivery confirmation. */
+  const confirming = noteId => manual.has(noteId)
+
+  /** Silently drop a manual confirmation (the note was deleted or cancelled). */
+  const abandon = noteId => {
+    const record = manual.get(noteId)
+
+    if (!record) {
+      return false
+    }
+
+    if (record.timer !== null) {
+      clearTimeoutFn(record.timer)
+      record.timer = null
+    }
+
+    manual.delete(noteId)
+
+    return true
+  }
+
   /** Feed the whole `busyBySession` map on every change. */
   const onBusyChange = busy => {
     const bySession = busy && typeof busy === 'object' ? busy : {}
 
+    // A manual submit is confirmed by the same proof: the turn starting.
+    for (const [noteId, record] of manual) {
+      if (bySession[record.sid]) {
+        finishManual(noteId, record)
+      }
+    }
+
     for (const [sid, entry] of sessions) {
       if (bySession[sid]) {
         entry.sawBusy = true
+
+        if (entry.phase === 'confirming') {
+          // The turn started: this submit did reach the session.
+          finishConfirm(entry, sid)
+
+          continue
+        }
 
         if (entry.phase === 'settling') {
           clearTimer(entry)
@@ -617,10 +851,69 @@ export function createSendQueue({
     }
   }
 
-  /** Focus moved: the chat a waiting note targets may now be on screen. */
-  const onFocusChange = () => retryWaiting()
+  /**
+   * Gateway `session.info` events: the second proof of delivery. A confirming
+   * entry is sent when the event is for its session and shows the turn running
+   * (or a pending prompt that starts with the note body).
+   */
+  const onSessionInfo = event => {
+    for (const [sid, entry] of sessions) {
+      if (entry.phase !== 'confirming' || !entry.confirmItem) {
+        continue
+      }
+
+      if (sessionInfoConfirms(event, sid, entry.confirmItem.body)) {
+        finishConfirm(entry, sid)
+      }
+    }
+
+    for (const [noteId, record] of manual) {
+      if (sessionInfoConfirms(event, record.item.sid, record.item.body)) {
+        finishManual(noteId, record)
+      }
+    }
+  }
+
+  /**
+   * Focus moved. A waiting note whose chat just became focused is NOT retried
+   * immediately: a just-opened chat is still hydrating and its composer silently
+   * drops the submit, so the retry is scheduled 1.5 s out and cancelled if focus
+   * moves away. The 3 s interval retry stays and naturally fires >=1.5 s later.
+   */
+  const onFocusChange = focusedIds => {
+    const ids = new Set(
+      (Array.isArray(focusedIds) ? focusedIds : [focusedIds]).filter(
+        id => typeof id === 'string' && id
+      )
+    )
+
+    for (const [sid, entry] of sessions) {
+      if (entry.phase !== 'waiting' || !ids.has(sid)) {
+        clearSettle(entry)
+
+        continue
+      }
+
+      if (entry.settleTimer !== null) {
+        continue
+      }
+
+      entry.settleTimer = setTimeoutFn(() => {
+        entry.settleTimer = null
+
+        if (entry.phase !== 'waiting') {
+          return
+        }
+
+        retryWaiting(sid)
+      }, focusSettleMs)
+    }
+  }
 
   const cancel = noteId => {
+    // A manual confirmation in flight is silently dropped with the note.
+    abandon(noteId)
+
     for (const [sid, entry] of sessions) {
       const index = entry.items.findIndex(item => item.noteId === noteId)
 
@@ -631,10 +924,12 @@ export function createSendQueue({
       entry.items.splice(index, 1)
 
       if (!entry.items.length) {
-        clearTimer(entry)
+        clearTimers(entry)
         entry.phase = 'idle'
-      } else if (index === 0 && entry.phase === 'waiting') {
-        // The waiting head is gone; the next note is an ordinary queued one.
+      } else if (index === 0 && (entry.phase === 'waiting' || entry.phase === 'confirming')) {
+        // The waiting/confirming head is gone; the next note is an ordinary
+        // queued one.
+        clearTimers(entry)
         entry.phase = 'idle'
         entry.sawBusy = false
         pump(sid)
@@ -653,8 +948,16 @@ export function createSendQueue({
 
   const dispose = () => {
     for (const entry of sessions.values()) {
-      clearTimer(entry)
+      clearTimers(entry)
     }
+
+    for (const record of manual.values()) {
+      if (record.timer !== null) {
+        clearTimeoutFn(record.timer)
+      }
+    }
+
+    manual.clear()
 
     if (waitTimer !== null) {
       clearIntervalFn(waitTimer)
@@ -664,7 +967,18 @@ export function createSendQueue({
     sessions.clear()
   }
 
-  return { cancel, dispose, enqueue, onBusyChange, onFocusChange, pending }
+  return {
+    abandon,
+    cancel,
+    confirming,
+    dispose,
+    enqueue,
+    onBusyChange,
+    onFocusChange,
+    onSessionInfo,
+    pending,
+    sendNow
+  }
 }
 
 // ── Persistence (ctx.files, else ctx.storage) ──────────────────────────────
@@ -876,14 +1190,31 @@ function createStash(ctx) {
       if (event.type === 'cancelled') {
         $notes.set(setNoteStatus($notes.get(), event.noteId, 'active'))
         persistence.schedule($notes.get())
+
+        return
+      }
+
+      if (event.type === 'failed') {
+        // The immediate path's submit returned true but the chat never started a
+        // turn within 8 s: the user is looking at that chat, so say so.
+        $notes.set(setNoteStatus($notes.get(), event.noteId, 'active'))
+        persistence.schedule($notes.get())
+        host.notify({ kind: 'error', message: t('sendFailed') })
       }
     }
   })
 
   ctx.onDispose(host.state.busyBySession.subscribe(map => queue.onBusyChange(map)))
-  // Focus moving is the main way a waiting note's chat becomes on screen.
-  ctx.onDispose(host.state.focusedSessionId.subscribe(() => queue.onFocusChange()))
-  ctx.onDispose(host.state.focusedStoredSessionId.subscribe(() => queue.onFocusChange()))
+  // Focus moving is the main way a waiting note's chat becomes on screen. Both
+  // focused ids are passed: the runtime id and the durable stored id.
+  const onFocusChange = () =>
+    queue.onFocusChange([
+      host.state.focusedSessionId.get(),
+      host.state.focusedStoredSessionId.get()
+    ])
+
+  ctx.onDispose(host.state.focusedSessionId.subscribe(onFocusChange))
+  ctx.onDispose(host.state.focusedStoredSessionId.subscribe(onFocusChange))
 
   // The gateway emits `session.info` with `payload.title` whenever a chat's
   // title changes — the provisional first-prompt title, then the generated one
@@ -891,6 +1222,10 @@ function createStash(ctx) {
   // provisional title, since the 5 s poll stops as soon as ANY title is known.
   // The poll stays as the fallback for a title that arrives with no event.
   ctx.onEvent('session.info', event => {
+    // The same event is the second proof of delivery for a confirming submit:
+    // `payload.running` true (or a pending prompt matching the note body).
+    queue.onSessionInfo(event)
+
     const update = titleUpdateFromEvent(event, host.state.profile.get())
 
     if (!update) {
@@ -1003,6 +1338,7 @@ function createStash(ctx) {
         .catch(() => host.notify({ kind: 'error', message: t('composerFailed') }))
     },
     remove: id => {
+      queue.abandon(id)
       $notes.set(removeNote($notes.get(), id))
       persist()
     },
@@ -1040,16 +1376,17 @@ function createStash(ctx) {
         return
       }
 
-      const ok = host.composer.submit(sid, note.body)
-
-      if (!ok) {
-        host.notify({ kind: 'error', message: t('sendFailed') })
-
+      // A manual submit is still awaiting confirmation: submitting again would
+      // deliver the note twice.
+      if (queue.confirming(note.id)) {
         return
       }
 
-      $notes.set(setNoteStatus($notes.get(), note.id, 'sent', { sentAt: Date.now(), sentTo: sid }))
-      persist()
+      // submit() returning true is not proof of delivery — the note stays Active
+      // until the session proves it started a turn (or reports `failed`).
+      if (queue.sendNow(note, sid, targetProfile) === 'failed') {
+        host.notify({ kind: 'error', message: t('sendFailed') })
+      }
     }
   }
 }

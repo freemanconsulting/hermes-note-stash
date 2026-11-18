@@ -84,7 +84,10 @@ false when the queued chat is not the focused one at the moment its turn ends.
 That is not a failure. The note becomes **Waiting**, stays at the head of its
 session's FIFO (later notes keep their order behind it), and sends itself once
 that chat is focused again and idle — retried on a focus change, a busy change,
-or a 3 s interval that runs only while a note waits. A waiting row shows a
+or a 3 s interval that runs only while a note waits. A note is marked sent only
+after the chat actually starts the turn — `host.composer.submit` returning true
+is not proof of delivery — and a just-opened chat gets ~1.5 s to settle before a
+waiting note is sent. A waiting row shows a
 **Waiting** badge (tooltip: "The chat was not on screen when its turn ended"),
 a muted `Sends when you open “<title>”` line naming the chat from the title
 cache, and **Cancel**. It never switches your view and never sends to another
