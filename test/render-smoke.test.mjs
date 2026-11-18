@@ -69,6 +69,80 @@ function renderNode(node) {
 }
 
 describe('render smoke', () => {
+  /** Every element in the tree whose className names a note row. */
+  function findRows(node, out = []) {
+    if (node === null || typeof node !== 'object') {
+      return out
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        findRows(child, out)
+      }
+
+      return out
+    }
+
+    if (typeof node.type === 'function') {
+      findRows(node.type(node.props ?? {}), out)
+    }
+
+    if (typeof node.props?.className === 'string' && node.props.className.includes('group/note')) {
+      out.push(node)
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            findRows(item, out)
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        findRows(value, out)
+      }
+    }
+
+    return out
+  }
+
+  /** Every button's aria-label inside one row element. */
+  function buttonLabels(node, out = []) {
+    if (node === null || typeof node !== 'object') {
+      return out
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        buttonLabels(child, out)
+      }
+
+      return out
+    }
+
+    if (node.props?.type === 'button' && typeof node.props['aria-label'] === 'string') {
+      out.push(node.props['aria-label'])
+    }
+
+    if (typeof node.type === 'function') {
+      buttonLabels(node.type(node.props ?? {}), out)
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            buttonLabels(item, out)
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        buttonLabels(value, out)
+      }
+    }
+
+    return out
+  }
+
   it('registers and renders every contribution without throwing', async () => {
     const contributions = []
     const disposers = []
@@ -234,5 +308,45 @@ describe('render smoke', () => {
     // Effects ran during the walk; run their cleanups now, so a cleanup that
     // throws also fails the test.
     react.runEffectCleanups()
+  })
+
+  it('renders an image note with Put in composer as its labeled action and no Send', () => {
+    const contributions = []
+    const ctx = {
+      i18n: { register: () => {}, t: key => String(key) },
+      onDispose: () => {},
+      onEvent: () => () => {},
+      register: contribution => contributions.push(contribution),
+      setInterval: () => () => {},
+      setTimeout: () => () => {},
+      storage: { get: (key, fallback) => fallback, set: () => {} }
+    }
+
+    sdk.host.state.focusedSessionId.set('sess-1')
+
+    plugin.register(ctx)
+
+    const pane = contributions.find(contribution => contribution.id === 'pane')
+    const stash = pane.render().props.stash
+
+    // addNote prepends, so rows[0] is the last added (text) and rows[1] the image note.
+    stash.addNote({
+      body: 'with images',
+      images: [{ bytes: 8, file: 'img-note-img-0.txt', h: 2, mime: 'image/png', w: 3 }],
+      title: 'Images only'
+    })
+    stash.addNote({ body: 'text only', title: 'Text only' })
+
+    const rows = findRows(pane.render())
+
+    assert.equal(rows.length, 2)
+
+    const textLabels = buttonLabels(rows[0])
+    const imageLabels = buttonLabels(rows[1])
+
+    assert.ok(imageLabels.includes('putInComposer'), 'the image note has a labeled Put in composer button')
+    assert.ok(!imageLabels.includes('sendTo'), 'the image note has no Send button')
+    assert.ok(textLabels.includes('sendTo'), 'a text-only note keeps its Send button')
+    assert.ok(textLabels.includes('putInComposer'), 'a text-only note keeps the secondary Put in composer action')
   })
 })

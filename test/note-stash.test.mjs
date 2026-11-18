@@ -25,8 +25,10 @@ installStubs()
 const {
   createPersistence,
   createSendQueue,
+  dataUrlToFile,
   parseNotesFile,
   previewFor,
+  putInComposerWithImages,
   sessionInfoConfirms,
   titleFromRows,
   titleUpdateFromEvent
@@ -155,6 +157,137 @@ describe('sessionInfoConfirms', () => {
     )
     assert.equal(sessionInfoConfirms({ session_id: 's1', payload: { pending: [{ text: 'x' }] } }, 's1', ''), false)
     assert.equal(sessionInfoConfirms(null, 's1', body), false)
+  })
+})
+
+describe('dataUrlToFile', () => {
+  it('decodes a stored data URL into a File with the bytes and mime intact', async () => {
+    const file = dataUrlToFile('data:image/png;base64,iVBORw0KGgo=', 'note-image-0.png')
+
+    assert.equal(file.name, 'note-image-0.png')
+    assert.equal(file.type, 'image/png')
+    assert.equal(file.size, 8)
+    assert.deepEqual([...new Uint8Array(await file.arrayBuffer())], [137, 80, 78, 71, 13, 10, 26, 10])
+    assert.equal(dataUrlToFile('not-a-data-url', 'x.png'), null)
+    assert.equal(dataUrlToFile('data:image/png,abc', 'x.png'), null)
+  })
+})
+
+describe('putInComposerWithImages', () => {
+  const IMAGES = [
+    { dataUrl: 'data:image/png;base64,iVBORw0KGgo=', file: 'img-note-0.txt', mime: 'image/png' },
+    { dataUrl: 'data:image/jpeg;base64,iVBORw0KGgo=', file: 'img-note-1.txt', mime: 'image/jpeg' }
+  ]
+
+  it('inserts the text once, then dispatches one paste with one File per image and focuses', async () => {
+    const inserts = []
+    const pastes = []
+    const focused = []
+    const notices = []
+
+    const ok = await putInComposerWithImages(
+      { body: 'hello', images: IMAGES },
+      {
+        dispatchPaste: files => {
+          pastes.push(files)
+
+          return true
+        },
+        focus: sid => focused.push(sid),
+        insertText: (sid, body, options) => {
+          inserts.push([sid, body, options])
+
+          return true
+        },
+        notify: message => notices.push(message),
+        sid: 'sess-1'
+      }
+    )
+
+    assert.equal(ok, true)
+    assert.deepEqual(inserts, [['sess-1', 'hello', { mode: 'block' }]], 'the text goes in once as a block')
+    assert.equal(pastes.length, 1, 'one paste carries every image')
+    assert.deepEqual(
+      pastes[0].map(file => [file.name, file.type]),
+      [
+        ['note-image-0.png', 'image/png'],
+        ['note-image-1.jpg', 'image/jpeg']
+      ]
+    )
+    assert.deepEqual(focused, ['sess-1'], 'the composer is focused after the paste')
+    assert.deepEqual(notices, [])
+  })
+
+  it('notifies and does not focus when the paste is not handled', async () => {
+    const focused = []
+    const notices = []
+
+    const ok = await putInComposerWithImages(
+      { body: 'hello', images: IMAGES },
+      {
+        dispatchPaste: () => false,
+        focus: sid => focused.push(sid),
+        insertText: () => true,
+        notify: message => notices.push(message),
+        sid: 'sess-1'
+      }
+    )
+
+    assert.equal(ok, false)
+    assert.deepEqual(notices, ['putInComposerImagesFailedWithText'], 'the text already went in, so the message says so')
+    assert.deepEqual(focused, [], 'no focus when the images did not land')
+  })
+
+  it('does not insert text for an images-only note', async () => {
+    const inserts = []
+    const pastes = []
+
+    const ok = await putInComposerWithImages(
+      { body: '', images: IMAGES },
+      {
+        dispatchPaste: files => {
+          pastes.push(files)
+
+          return true
+        },
+        focus: () => {},
+        insertText: (sid, body) => {
+          inserts.push(body)
+
+          return true
+        },
+        notify: () => {},
+        sid: 'sess-1'
+      }
+    )
+
+    assert.equal(ok, true)
+    assert.deepEqual(inserts, [], 'there is no text to insert')
+    assert.equal(pastes[0].length, 2)
+  })
+
+  it('notifies composerFailed and dispatches no paste when insertText returns false', async () => {
+    const pastes = []
+    const notices = []
+
+    const ok = await putInComposerWithImages(
+      { body: 'hello', images: IMAGES },
+      {
+        dispatchPaste: files => {
+          pastes.push(files)
+
+          return true
+        },
+        focus: () => {},
+        insertText: () => false,
+        notify: message => notices.push(message),
+        sid: 'sess-1'
+      }
+    )
+
+    assert.equal(ok, false)
+    assert.deepEqual(notices, ['composerFailed'])
+    assert.deepEqual(pastes, [], 'no paste is attempted after a failed insert')
   })
 })
 

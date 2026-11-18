@@ -59,9 +59,9 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
     queued (see "Why the busy queue").
   - **Put in composer** — appends the body to the focused session's existing
     draft (`host.composer.insertText(sid, body, { mode: 'block' })`, never
-    clobbers it) and then focuses the composer; the note stays active. Text
-    only — images are sent only with **Send**, and the tooltip says so when the
-    note has images.
+    clobbers it) and then focuses the composer; the note stays active. For a
+    note with images this is the labeled action instead of **Send**: it adds the
+    text and the images (see "Images").
   - **Copy** — copies the body to the clipboard. Text only, like **Put in
     composer**.
   - **Delete** — removes the note after a confirmation.
@@ -79,13 +79,16 @@ note editor. Each image is stored as one `img-<note>-<n>.txt` text file holding
 its data URL in the plugin's own data folder, capped at ~3 MB per image. The
 editor shows thumbnails with a remove button; a row shows up to three with a
 `+N` count, and a missing file renders a placeholder instead of breaking the
-row. An images-only note (no body) sends its title, or `(image)` when untitled.
+row.
 
-**Send** uploads the images to the target chat's own gateway first — one
-`image.attach_bytes` per image, through the route for the profile recorded with
-the note — then sends the text. If the send is not confirmed, the staged images
-are withdrawn with `image.detach` so your next message does not inherit them.
-**Put in composer** and **Copy** are text-only.
+A note with images has **Put in composer** as its labeled action instead of
+**Send**. It inserts the note's text into the chat you are viewing, then
+dispatches a synthetic paste event carrying one image File per stored image;
+Desktop's own paste handling turns that into real attachment chips in that
+chat's composer, the same path as a real Cmd+V. Nothing is sent until you press
+Enter. If the paste is not handled (an open dialog, or no composer to take it),
+Note Stash shows an error and leaves the text it already added in place. An
+images-only note adds just its images. **Copy** stays text-only.
 
 ## Why the busy queue
 
@@ -126,10 +129,12 @@ app restart, so nothing auto-sends when the app comes back.
   of the session and shows one warning naming the failure. A missing or
   malformed `notes.json` is an empty store.
 - **Images.** Image files are read and written only as `img-*.txt` files in the
-  plugin's own data folder, one data URL per file. They are sent only when you
-  click **Send**, which uploads them to the target session's own gateway with
-  `image.attach_bytes` and withdraws them with `image.detach` if the send is not
-  confirmed. Nothing else reads or sends them.
+  plugin's own data folder, one data URL per file. They leave the plugin only
+  when you click **Put in composer** on a note with images: the plugin reads the
+  stored data URL and dispatches a synthetic paste event carrying the image as a
+  File; Desktop's own paste handling adds it to the chat on screen as an
+  attachment. Nothing is sent until you press Enter. Nothing else reads or sends
+  them.
 - **No network calls and no third-party services.** The only session data the
   plugin reads is the focused profile's persisted-session list, through
   `host.listPersistedSessions` — a local read, no gateway dial — when the
@@ -140,8 +145,9 @@ app restart, so nothing auto-sends when the app comes back.
 - **Note text leaves the plugin only when you act.** Clicking **Send** submits
   the note body as a prompt to the focused session, which then goes to your
   configured model like any prompt you type. **Put in composer** inserts it into
-  that session's draft. **Copy** writes it to the clipboard. Nothing else sends
-  note text anywhere.
+  that session's draft; for a note with images it also adds the images to the
+  composer as attachments, which are sent only when you press Enter. **Copy**
+  writes it to the clipboard. Nothing else sends note text anywhere.
 - **No telemetry**, no usage reporting, and no stored credentials.
 - The plugin reads and writes no files outside its own data folder.
 
@@ -160,12 +166,16 @@ functions taking injected dependencies (`submit`, `isBusy`, timers, clock).
 
 Covered: send-while-busy never submits and submits exactly once after
 busy→idle + settle; FIFO across two queued notes waits for the second idle
-transition; submit returning `false` removes the note from the send queue,
-raises the send-failed error, and leaves it Active, with any notes queued behind
-it in that session dropped back to Active; a persisted `queued` note loads as
-`active`; malformed/missing `notes.json` yields an empty store; a refused
-(`protected`) file write falls back to `ctx.storage`, the notes read back from
-storage, exactly one warning toast is raised, and later writes do not re-warn;
+transition; submit returning `false` holds the head note as Waiting silently and
+retries on a focus change, a busy change or the 3 s interval; a submit that
+returns true but never starts a turn goes back to Waiting after 8 s; a persisted
+`queued` note loads as `active`; malformed/missing `notes.json` yields an empty
+store; a refused (`protected`) file write falls back to `ctx.storage`, the notes
+read back from storage, exactly one warning toast is raised, and later writes do
+not re-warn; `dataUrlToFile` round-trips the bytes and mime of a stored data URL;
+`putInComposerWithImages` inserts the text once, dispatches one paste with one
+File per image and focuses, skips the insert for an images-only note, and
+reports an error without focusing when the paste is not handled;
 `previewFor` starts an untitled note's preview at its second line;
 `titleFromRows` matches a title by session id or lineage root id;
 `titleUpdateFromEvent` extracts a title from a `session.info` event. An i18n

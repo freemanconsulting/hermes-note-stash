@@ -7,13 +7,14 @@
   plugin's own data folder, up to ~3 MB per image. The editor shows thumbnails
   with a remove button; a row shows up to three with a `+N` count, and a missing
   file renders a placeholder instead of breaking the row.
-- **Send** uploads a note's images to the target chat's own gateway (one
-  `image.attach_bytes` per image) and then sends the text. If delivery is not
-  confirmed, the staged images are withdrawn with `image.detach` so they do not
-  leak into your next message. An images-only note sends its title, or
-  `(image)` when untitled.
-- **Put in composer** and **Copy** are text-only: their tooltips say so when the
-  note has images, and images are sent only with **Send**.
+- Notes with images have **Put in composer** as their labeled action instead of
+  **Send**: it inserts the note's text and then dispatches a synthetic paste
+  event that Desktop's own paste handling turns into real image attachments in
+  the chat on screen. Nothing is sent until you press Enter. An images-only
+  note adds just its images.
+- **Copy** stays text-only; its tooltip says so when the note has images.
+- Text-only notes keep the automatic **Send**, busy queue, waiting and delivery
+  confirmation from 1.1.1, unchanged.
 
 ## 1.1.1
 
