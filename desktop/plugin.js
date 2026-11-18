@@ -2209,20 +2209,207 @@ function insertTwoSpaces(event) {
 
 const CODE_FONT = { fontFamily: 'var(--font-mono, monospace)' }
 
+/** Image files from a paste's `clipboardData`: `items` kind 'file' + image/*,
+ *  then `files` as the Chromium/Electron fallback (mirrors the composer's
+ *  text-utils.ts:106-123). */
+export function imageFilesFromClipboard(clipboard) {
+  const files = []
+  const seen = new Set()
+  const push = file => {
+    if (file && typeof file.type === 'string' && file.type.startsWith('image/') && !seen.has(file)) {
+      seen.add(file)
+      files.push(file)
+    }
+  }
+
+  if (clipboard?.items?.length) {
+    for (const item of clipboard.items) {
+      if (item.kind === 'file' && typeof item.type === 'string' && item.type.startsWith('image/')) {
+        push(item.getAsFile())
+      }
+    }
+  }
+
+  if (!files.length && clipboard?.files?.length) {
+    for (let index = 0; index < clipboard.files.length; index += 1) {
+      push(clipboard.files.item(index))
+    }
+  }
+
+  return files
+}
+
+/** Image files from a drop's `dataTransfer`. */
+export function imageFilesFromDataTransfer(transfer) {
+  const files = []
+
+  if (transfer?.files?.length) {
+    for (let index = 0; index < transfer.files.length; index += 1) {
+      const file = transfer.files.item(index)
+
+      if (file && typeof file.type === 'string' && file.type.startsWith('image/')) {
+        files.push(file)
+      }
+    }
+  }
+
+  return files
+}
+
+/** A File as its data URL. */
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new globalThis.FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('read failed'))
+    reader.readAsDataURL(file)
+  })
+}
+
+/** Natural pixel size of a data URL; 0×0 when the image cannot be decoded. */
+function loadImageSize(dataUrl) {
+  return new Promise(resolve => {
+    const image = new globalThis.Image()
+    image.onload = () =>
+      resolve({ h: image.naturalHeight || image.height || 0, w: image.naturalWidth || image.width || 0 })
+    image.onerror = () => resolve({ h: 0, w: 0 })
+    image.src = dataUrl
+  })
+}
+
+/** The persisted image record, stripped of any editor-only `dataUrl`. */
+export function imageMeta(image) {
+  return {
+    bytes: Number.isFinite(image?.bytes) ? image.bytes : 0,
+    file: String(image?.file || ''),
+    h: Number.isFinite(image?.h) ? image.h : 0,
+    mime: String(image?.mime || ''),
+    w: Number.isFinite(image?.w) ? image.w : 0
+  }
+}
+
+/** One thumbnail: the data URL, or a placeholder for a missing file. */
+function ImageThumb({ dataUrl, image, onRemove, size = 'h-14 w-14', t }) {
+  return jsxs('div', {
+    className: 'relative',
+    children: [
+      dataUrl
+        ? jsx('img', {
+            alt: '',
+            className: cn(size, 'rounded border border-(--stroke-nous) object-cover'),
+            src: dataUrl
+          })
+        : jsx('div', {
+            className: cn(
+              size,
+              'flex items-center justify-center rounded border border-(--stroke-nous) text-(--ui-text-tertiary)'
+            ),
+            children: jsx(icons.ImageOff, { 'aria-label': t('imageMissing'), className: 'size-4' })
+          }),
+      onRemove
+        ? jsx('button', {
+            'aria-label': t('imageRemove'),
+            className:
+              'absolute -right-1.5 -top-1.5 inline-flex size-4 items-center justify-center rounded-full bg-(--ui-chat-bubble-background) text-(--ui-text-secondary) shadow-nous hover:text-foreground',
+            onClick: () => onRemove(image),
+            type: 'button',
+            children: jsx(icons.X, { className: 'size-2.5' })
+          })
+        : null
+    ]
+  })
+}
+
+/** The editor's thumbnail grid, each with a remove button. */
+function ImageThumbnails({ images, onRemove, t }) {
+  if (!images.length) {
+    return null
+  }
+
+  return jsx('div', {
+    className: 'flex flex-wrap gap-1.5',
+    children: images.map(image =>
+      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onRemove, t })
+    )
+  })
+}
+
+/** A note row's thumbnail strip: max 3, then `+N`. */
+function ImageStrip({ data, images, t }) {
+  const shown = images.slice(0, 3)
+  const more = images.length - shown.length
+
+  return jsxs('div', {
+    className: 'mt-1 flex items-center gap-1',
+    children: [
+      ...shown.map(image =>
+        jsx(ImageThumb, { dataUrl: data[image.file] ?? null, image, key: image.file, size: 'h-8 w-8', t })
+      ),
+      more > 0
+        ? jsx('span', {
+            className: 'tabular-nums text-[0.625rem] leading-none text-(--ui-text-tertiary)',
+            children: t('imageMore', more)
+          })
+        : null
+    ]
+  })
+}
+
 function CaptureDialog({ stash }) {
   const t = usePluginI18n(ID)
   const open = useValue(stash.$capture)
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
+  const [images, setImages] = useState([])
   const [confirmDiscard, setConfirmDiscard] = useState(false)
   const bodyRef = useRef(null)
-  const dirty = Boolean(title.trim() || body.trim())
-  const canSave = Boolean(body.trim())
+  const draftId = useRef('')
+  const dirty = Boolean(title.trim() || body.trim() || images.length)
+  const canSave = Boolean(body.trim() || images.length)
 
-  const close = () => {
+  /** Write each image file under the draft note id and hold it with its data
+   *  URL for the thumbnail. */
+  const addFiles = async files => {
+    const list = Array.isArray(files) ? files : []
+
+    if (!list.length) {
+      return
+    }
+
+    if (!draftId.current) {
+      draftId.current = makeNoteId()
+    }
+
+    let next = images
+
+    for (const file of list) {
+      let dataUrl = ''
+
+      try {
+        dataUrl = await readFileAsDataUrl(file)
+      } catch {
+        continue
+      }
+
+      const size = await loadImageSize(dataUrl)
+      const image = await stash.addImage(draftId.current, next, dataUrl, size)
+
+      if (image) {
+        next = [...next, { ...image, dataUrl }]
+        setImages(next)
+      }
+    }
+  }
+
+  const close = (discardImages = true) => {
+    if (discardImages && images.length) {
+      stash.discardImages(images)
+    }
+
     stash.closeCapture()
     setTitle('')
     setBody('')
+    setImages([])
     setConfirmDiscard(false)
   }
 
@@ -2241,9 +2428,15 @@ function CaptureDialog({ stash }) {
       return
     }
 
-    stash.addNote({ body, title })
+    // The note takes ownership of the image files; close must not trash them.
+    stash.addNote({
+      body,
+      id: draftId.current || undefined,
+      images: images.map(imageMeta),
+      title
+    })
     haptic('tap')
-    close()
+    close(false)
   }
 
   return jsxs('div', {
@@ -2273,6 +2466,24 @@ function CaptureDialog({ stash }) {
               save()
             }
           },
+          // DialogContent spreads props onto Radix Content (dialog.tsx:176).
+          // preventDefault on BOTH dragover and drop, else Electron opens the
+          // file instead of the dialog taking it (electron/main.ts:12106-12113).
+          onDragOver: event => {
+            event.preventDefault()
+          },
+          onDrop: event => {
+            event.preventDefault()
+            void addFiles(imageFilesFromDataTransfer(event.dataTransfer))
+          },
+          onPaste: event => {
+            const files = imageFilesFromClipboard(event.clipboardData)
+
+            if (files.length) {
+              event.preventDefault()
+              void addFiles(files)
+            }
+          },
           children: [
             jsxs(DialogHeader, {
               children: [
@@ -2298,6 +2509,14 @@ function CaptureDialog({ stash }) {
               rows: 10,
               style: CODE_FONT,
               value: body
+            }),
+            jsx(ImageThumbnails, {
+              images,
+              onRemove: image => {
+                setImages(images.filter(entry => entry.file !== image.file))
+                stash.discardImages([image])
+              },
+              t
             }),
             jsxs(DialogFooter, {
               className: 'items-center gap-2',
@@ -2351,22 +2570,85 @@ function SmallAction({ disabled = false, icon: Icon, label, onClick }) {
   })
 }
 
-function NoteEditor({ note, onCancel, onSave, t }) {
+function NoteEditor({ note, onCancel, onSave, stash, t }) {
   const [title, setTitle] = useState(note.title)
   const [body, setBody] = useState(note.body)
+  const imageData = useValue(stash.$imageData)
+  const [images, setImages] = useState(() =>
+    (note.images ?? []).map(image => ({ ...image, dataUrl: imageData[image.file] ?? null }))
+  )
+  const initialFiles = useRef(new Set((note.images ?? []).map(image => image.file)))
+
+  /** Write each image file under this note's id and hold it with its data URL. */
+  const addFiles = async files => {
+    const list = Array.isArray(files) ? files : []
+
+    if (!list.length) {
+      return
+    }
+
+    let next = images
+
+    for (const file of list) {
+      let dataUrl = ''
+
+      try {
+        dataUrl = await readFileAsDataUrl(file)
+      } catch {
+        continue
+      }
+
+      const size = await loadImageSize(dataUrl)
+      const image = await stash.addImage(note.id, next, dataUrl, size)
+
+      if (image) {
+        next = [...next, { ...image, dataUrl }]
+        setImages(next)
+      }
+    }
+  }
+
+  const cancel = () => {
+    // Only images added in this edit session are discarded; the note's own
+    // files stay.
+    const added = images.filter(image => !initialFiles.current.has(image.file))
+
+    if (added.length) {
+      stash.discardImages(added)
+    }
+
+    onCancel()
+  }
 
   const save = () => {
-    if (!title.trim() && !body.trim()) {
-      onCancel()
+    if (!title.trim() && !body.trim() && !images.length) {
+      cancel()
 
       return
     }
 
-    onSave({ body, title })
+    onSave({ body, images: images.map(imageMeta), title })
   }
 
   return jsxs('div', {
     className: 'grid gap-3',
+    // preventDefault on BOTH dragover and drop, else Electron opens the file
+    // instead of the editor taking it (electron/main.ts:12106-12113).
+    onDragOver: event => {
+      event.preventDefault()
+    },
+    onDrop: event => {
+      event.preventDefault()
+      void addFiles(imageFilesFromDataTransfer(event.dataTransfer))
+    },
+    onPaste: event => {
+      const files = imageFilesFromClipboard(event.clipboardData)
+
+      if (files.length) {
+        event.preventDefault()
+        void addFiles(files)
+      }
+    },
     children: [
       jsx(Input, {
         onChange: event => setTitle(event.target.value),
@@ -2386,12 +2668,20 @@ function NoteEditor({ note, onCancel, onSave, t }) {
         style: CODE_FONT,
         value: body
       }),
+      jsx(ImageThumbnails, {
+        images,
+        onRemove: image => {
+          setImages(images.filter(entry => entry.file !== image.file))
+          stash.discardImages([image])
+        },
+        t
+      }),
       jsxs('div', {
         className: 'flex items-center gap-2',
         children: [
           jsx(Button, { onClick: save, size: 'xs', type: 'button', children: t('save') }),
           jsx(Button, {
-            onClick: onCancel,
+            onClick: cancel,
             size: 'xs',
             type: 'button',
             variant: 'ghost',
@@ -2406,6 +2696,7 @@ function NoteEditor({ note, onCancel, onSave, t }) {
 function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
   const focused = useValue(host.state.focusedSessionId)
   const titles = useValue($sessionTitles)
+  const imageData = useValue(stash.$imageData)
   const focusedProfile = useValue(host.state.focusedSessionProfile)
   const primaryProfile = useValue(host.state.profile)
   const sent = note.status === 'sent'
@@ -2460,6 +2751,9 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
                     'mt-1 line-clamp-2 whitespace-pre-wrap break-words font-mono text-[0.625rem] leading-[1.45] text-(--ui-text-quaternary)',
                   children: preview
                 })
+              : null,
+            note.images?.length
+              ? jsx(ImageStrip, { data: imageData, images: note.images, t })
               : null
           ]
         })
@@ -2535,13 +2829,13 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
               jsx(SmallAction, {
                 disabled: !focused,
                 icon: icons.PencilLine,
-                label: t('putInComposer'),
+                label: note.images?.length ? t('putInComposerImages') : t('putInComposer'),
                 onClick: () => stash.putInComposer(note)
               }),
               jsx(CopyButton, {
                 appearance: 'icon',
                 buttonSize: 'icon-xs',
-                label: t('copy'),
+                label: note.images?.length ? t('copyImages') : t('copy'),
                 text: note.body
               }),
               sent
@@ -2577,6 +2871,7 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
               stash.edit(note.id, patch)
               onToggleEdit()
             },
+            stash,
             t
           })
         : null
@@ -2762,6 +3057,7 @@ export default {
         chipTip: count => `Note Stash — ${count} active ${count === 1 ? 'note' : 'notes'}`,
         composerFailed: 'Note Stash could not put this note in the composer.',
         copy: 'Copy note',
+        copyImages: 'Copy note (text only — images are sent with Send)',
         delete: 'Delete',
         deleteDescription: 'It is removed from Note Stash for good.',
         deleteTitle: 'Delete this note?',
@@ -2787,6 +3083,7 @@ export default {
         noSession: 'Open a session first — there is no focused session to send to.',
         paneTitle: 'Note Stash',
         putInComposer: 'Put in composer',
+        putInComposerImages: 'Put in composer (text only — images are sent with Send)',
         queuedLine: 'Queued — sends when the turn ends',
         restore: 'Restore to active',
         save: 'Save',

@@ -51,13 +51,44 @@ function renderElement(node) {
 }
 
 describe('render smoke', () => {
-  it('registers and renders every contribution without throwing', () => {
+  it('registers and renders every contribution without throwing', async () => {
     const contributions = []
     const disposers = []
     const storage = new Map()
 
+    // Image + notes files. readText serves the data URL for a present image,
+    // not-found for one deliberately missing image, and the last text written
+    // for notes.json so the persistence write-then-verify passes.
+    const written = new Map()
+    const missingImage = 'img-smoke-note-1.txt'
+
     const ctx = {
-      files: undefined, // force the ctx.storage persistence path
+      files: {
+        dataFolder: 'data',
+        list: async () => ({ files: [], ok: true }),
+        readText: async (folder, file) => {
+          if (file === missingImage) {
+            return { error: 'not-found', ok: false }
+          }
+
+          if (written.has(file)) {
+            return { ok: true, text: written.get(file) }
+          }
+
+          if (file.startsWith('img-') && file.endsWith('.txt')) {
+            return { ok: true, text: 'data:image/png;base64,iVBORw0KGgo=' }
+          }
+
+          return { error: 'not-found', ok: false }
+        },
+        stat: async () => ({ ok: true }),
+        trash: async () => ({ ok: true }),
+        writeText: async (folder, file, text) => {
+          written.set(file, text)
+
+          return { ok: true }
+        }
+      },
       i18n: {
         register: () => {},
         t: key => String(key)
@@ -136,6 +167,28 @@ describe('render smoke', () => {
     stash.addNote({ body: 'queued one', title: 'Queued one' })
     stash.send(stash.$notes.get()[0])
     sdk.host.state.busyBySession.set({})
+
+    // An images-only note: two image files, one present and one missing, seeded
+    // through the plugin's own add path (addImage writes, addNote owns them).
+    const firstImage = await stash.addImage('smoke-note', [], 'data:image/png;base64,iVBORw0KGgo=', {
+      h: 8,
+      w: 8
+    })
+    const secondImage = await stash.addImage('smoke-note', [firstImage], 'data:image/png;base64,iVBORw0KGgo=', {
+      h: 8,
+      w: 8
+    })
+
+    assert.ok(firstImage && secondImage, 'both image files were written')
+
+    stash.addNote({ id: 'smoke-note', images: [firstImage, secondImage], title: 'Images only' })
+
+    // The row reads image files through loadImages; await it so the present
+    // thumbnail and the missing-file placeholder both render.
+    await stash.loadImages(stash.$notes.get())
+
+    assert.equal(stash.$imageData.get()[firstImage.file], 'data:image/png;base64,iVBORw0KGgo=')
+    assert.equal(stash.$imageData.get()[secondImage.file], null)
 
     // The walk below must cover the queued and waiting branches, not just the
     // active and sent ones: assert the seeds landed before rendering.
