@@ -1,6 +1,6 @@
 {
   "name": "hermes-note-stash",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Note Stash — sticky notes and a code stash for Hermes Desktop, with send-to-session.",
   "license": "MIT",
   "private": true,

@@ -45,8 +45,9 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
   **⌘⌥S** on macOS / **Ctrl+Alt+S** elsewhere (the contributed, rebindable
   action `note-stash.new-note`, category *view*, so it also appears in
   **Settings → Keybinds**). The dialog has an optional title and a monospace
-  body (a body is required to save): **Tab** inserts two spaces, **⌘/Ctrl+Enter**
-  saves, **Esc** cancels (it only asks to confirm when text would be lost).
+  body (a body or an image is required to save): **Tab** inserts two spaces,
+  **⌘/Ctrl+Enter** saves, **Esc** cancels (it only asks to confirm when a draft
+  would be lost). Paste or drop images into it (see "Images").
 - **Pane** — a right-side pane (320px) listing notes with title/first line,
   relative time and status. Filter **Active** / **Sent**, search, and click a
   row to edit it inline. Per note:
@@ -58,8 +59,11 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
     queued (see "Why the busy queue").
   - **Put in composer** — appends the body to the focused session's existing
     draft (`host.composer.insertText(sid, body, { mode: 'block' })`, never
-    clobbers it) and then focuses the composer; the note stays active.
-  - **Copy** — copies the body to the clipboard.
+    clobbers it) and then focuses the composer; the note stays active. Text
+    only — images are sent only with **Send**, and the tooltip says so when the
+    note has images.
+  - **Copy** — copies the body to the clipboard. Text only, like **Put in
+    composer**.
   - **Delete** — removes the note after a confirmation.
   - **Restore** — on a sent note, moves it back to Active (label: "Restore to
     active").
@@ -67,6 +71,21 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
   was focused when the note was written.
 - **Sent notes are kept** — in the **Sent** filter each row shows a
   `sent <time>` badge (e.g. "sent 5m ago") and has the **Restore** action.
+
+## Images
+
+Paste or drop PNG, JPEG, GIF, WebP or BMP images into the capture dialog or a
+note editor. Each image is stored as one `img-<note>-<n>.txt` text file holding
+its data URL in the plugin's own data folder, capped at ~3 MB per image. The
+editor shows thumbnails with a remove button; a row shows up to three with a
+`+N` count, and a missing file renders a placeholder instead of breaking the
+row. An images-only note (no body) sends its title, or `(image)` when untitled.
+
+**Send** uploads the images to the target chat's own gateway first — one
+`image.attach_bytes` per image, through the route for the profile recorded with
+the note — then sends the text. If the send is not confirmed, the staged images
+are withdrawn with `image.detach` so your next message does not inherit them.
+**Put in composer** and **Copy** are text-only.
 
 ## Why the busy queue
 
@@ -106,6 +125,11 @@ app restart, so nothing auto-sends when the app comes back.
   plugin falls back to its namespaced app storage (`ctx.storage`) for the rest
   of the session and shows one warning naming the failure. A missing or
   malformed `notes.json` is an empty store.
+- **Images.** Image files are read and written only as `img-*.txt` files in the
+  plugin's own data folder, one data URL per file. They are sent only when you
+  click **Send**, which uploads them to the target session's own gateway with
+  `image.attach_bytes` and withdraws them with `image.detach` if the send is not
+  confirmed. Nothing else reads or sends them.
 - **No network calls and no third-party services.** The only session data the
   plugin reads is the focused profile's persisted-session list, through
   `host.listPersistedSessions` — a local read, no gateway dial — when the
