@@ -63,6 +63,22 @@ const TITLE_LENGTH = 72
 const LABEL_TITLE_LENGTH = 32
 const KEYBIND_ID = 'note-stash.new-note'
 
+// Images are one flat UTF-8 text file per image in the plugin data folder,
+// holding exactly one data URL. `ctx.files.writeText` is UTF-8 only and capped
+// at 4 MiB, so the cap is enforced on the data URL before the write.
+const IMAGE_MAX_DATA_URL_BYTES = 4194304
+const IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp']
+const IMAGE_FILE_PREFIX = 'img-'
+const IMAGE_FILE_SUFFIX = '.txt'
+const IMAGE_FILE_RE = /^img-.+-(\d+)\.txt$/
+const IMAGE_EXT_BY_MIME = {
+  'image/bmp': 'bmp',
+  'image/gif': 'gif',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp'
+}
+
 /** `Send to "<title>"`, title truncated; no usable title → `Send to this chat`.
  *  The raw session id is never rendered. */
 export function sendLabelFor(title) {
@@ -222,8 +238,63 @@ export function createNote(input, now = Date.now()) {
   const body = typeof input?.body === 'string' ? input.body : ''
   const title = typeof input?.title === 'string' ? input.title.trim() : ''
   const id = typeof input?.id === 'string' && input.id ? input.id : makeNoteId(now)
+  const images = normalizeImages(input?.images)
+  const note = { body, createdAt: now, id, status: 'active', title, updatedAt: now }
 
-  return { body, createdAt: now, id, status: 'active', title, updatedAt: now }
+  if (images.length) {
+    note.images = images
+  }
+
+  return note
+}
+
+/** One persisted image record, validated. The file name is the only handle to
+ *  the image data; notes.json never carries inline image data (it shares the
+ *  4 MiB file cap with the data URLs). */
+export function normalizeImage(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return null
+  }
+
+  const file = typeof raw.file === 'string' ? raw.file.trim() : ''
+
+  if (!file || !IMAGE_FILE_RE.test(file)) {
+    return null
+  }
+
+  const mime = typeof raw.mime === 'string' ? raw.mime.trim().toLowerCase() : ''
+
+  if (!IMAGE_MIME_TYPES.includes(mime)) {
+    return null
+  }
+
+  const bytes = Number.isFinite(raw.bytes) && raw.bytes >= 0 ? raw.bytes : 0
+  const w = Number.isFinite(raw.w) && raw.w >= 0 ? raw.w : 0
+  const h = Number.isFinite(raw.h) && raw.h >= 0 ? raw.h : 0
+
+  return { bytes, file, h, mime, w }
+}
+
+export function normalizeImages(raw) {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  const images = []
+  const seen = new Set()
+
+  for (const item of raw) {
+    const image = normalizeImage(item)
+
+    if (!image || seen.has(image.file)) {
+      continue
+    }
+
+    seen.add(image.file)
+    images.push(image)
+  }
+
+  return images
 }
 
 /**
@@ -239,8 +310,9 @@ export function normalizeNote(raw, now = Date.now()) {
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : ''
   const body = typeof raw.body === 'string' ? raw.body : ''
   const title = typeof raw.title === 'string' ? raw.title : ''
+  const images = normalizeImages(raw.images)
 
-  if (!id || (!body.trim() && !title.trim())) {
+  if (!id || (!body.trim() && !title.trim() && !images.length)) {
     return null
   }
 
@@ -248,6 +320,10 @@ export function normalizeNote(raw, now = Date.now()) {
   const updatedAt = Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt
   const status = raw.status === 'sent' ? 'sent' : 'active'
   const note = { body, createdAt, id, status, title, updatedAt }
+
+  if (images.length) {
+    note.images = images
+  }
 
   if (status === 'sent') {
     if (Number.isFinite(raw.sentAt)) {
@@ -308,6 +384,267 @@ export function parseNotesFile(text, now = Date.now()) {
 
 export function serializeNotes(notes) {
   return JSON.stringify({ notes: Array.isArray(notes) ? notes : [], version: NOTES_VERSION }, null, 2)
+}
+
+// ── Images ─────────────────────────────────────────────────────────────────
+
+/** One flat file per image in the data root: `img-<noteId>-<n>.txt`. */
+export function imageFileName(noteId, index) {
+  return `${IMAGE_FILE_PREFIX}${noteId}-${index}${IMAGE_FILE_SUFFIX}`
+}
+
+/** The next free image index for a note, from its existing image file names. */
+export function nextImageIndex(images) {
+  let next = 0
+
+  for (const image of Array.isArray(images) ? images : []) {
+    const match = IMAGE_FILE_RE.exec(typeof image?.file === 'string' ? image.file : '')
+
+    if (match) {
+      next = Math.max(next, Number(match[1]) + 1)
+    }
+  }
+
+  return next
+}
+
+/** `data:<mime>;base64,<payload>` → `{base64, mime}`, or null. */
+export function parseImageDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string') {
+    return null
+  }
+
+  const text = dataUrl.trim()
+  const comma = text.indexOf(',')
+
+  if (comma < 0) {
+    return null
+  }
+
+  const head = text.slice(0, comma)
+  const match = /^data:([^;,]+);base64$/i.exec(head)
+
+  if (!match) {
+    return null
+  }
+
+  const base64 = text.slice(comma + 1).trim()
+
+  if (!base64) {
+    return null
+  }
+
+  return { base64, mime: match[1].toLowerCase() }
+}
+
+/** Raw byte count of a base64 payload (padding included). */
+export function base64Bytes(base64) {
+  const clean = String(base64 || '').replace(/[^A-Za-z0-9+/=]/g, '')
+
+  if (!clean) {
+    return 0
+  }
+
+  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0
+
+  return Math.floor((clean.length * 3) / 4) - padding
+}
+
+/** UTF-8 byte length of a string; data URLs are ASCII, so length is the same. */
+export function utf8ByteLength(text) {
+  const value = typeof text === 'string' ? text : ''
+
+  if (typeof globalThis.TextEncoder === 'function') {
+    return new globalThis.TextEncoder().encode(value).length
+  }
+
+  return value.length
+}
+
+/** Refuse an image BEFORE any write: unsupported mime, or a data URL over the
+ *  `ctx.files.writeText` 4 MiB cap. `{ok:true, mime, bytes, dataUrl}`. */
+export function validateImageDataUrl(dataUrl) {
+  const parsed = parseImageDataUrl(dataUrl)
+
+  if (!parsed) {
+    return {
+      error: 'invalid-image',
+      message: 'That is not an image Note Stash can read.',
+      ok: false
+    }
+  }
+
+  if (!IMAGE_MIME_TYPES.includes(parsed.mime)) {
+    return {
+      error: 'unsupported-image',
+      message: 'Only PNG, JPEG, GIF, WebP and BMP images are supported.',
+      ok: false
+    }
+  }
+
+  const text = dataUrl.trim()
+
+  if (utf8ByteLength(text) > IMAGE_MAX_DATA_URL_BYTES) {
+    return { error: 'too-large', message: 'Image too large for Note Stash (max ~3 MB)', ok: false }
+  }
+
+  return { bytes: base64Bytes(parsed.base64), dataUrl: text, mime: parsed.mime, ok: true }
+}
+
+/** The `filename` hint for `image.attach_bytes`: the image file name with the
+ *  extension its mime names, so the gateway's magic-byte sniff agrees. */
+export function attachFilename(image) {
+  const ext = IMAGE_EXT_BY_MIME[image?.mime] || 'png'
+  const base = String(image?.file || 'image').replace(/\.txt$/, '')
+
+  return `${base}.${ext}`
+}
+
+/** The text a note sends. An images-only note has no body, and submit trims and
+ *  refuses empty text (focus.ts:611-615), so it sends its title, else
+ *  `(image)`. */
+export function sendTextFor(note) {
+  const body = typeof note?.body === 'string' ? note.body : ''
+
+  if (body.trim()) {
+    return body
+  }
+
+  const title = typeof note?.title === 'string' ? note.title.trim() : ''
+
+  return title || '(image)'
+}
+
+/**
+ * Image files in the plugin data folder. One flat file per image, holding one
+ * data URL, written with `exclusive` and read back as text (never
+ * `readDataUrl`: it sniffs by extension and would return the base64 as
+ * `data:text/plain`). No subfolders — only the data root is auto-created.
+ */
+export function createImageStore(ctx) {
+  const files = ctx.files
+  const enabled = Boolean(
+    files &&
+      typeof files.writeText === 'function' &&
+      typeof files.readText === 'function' &&
+      typeof files.trash === 'function'
+  )
+  const folder = files?.dataFolder ?? 'data'
+
+  const write = async (noteId, index, dataUrl, dimensions = {}) => {
+    const valid = validateImageDataUrl(dataUrl)
+
+    if (!valid.ok) {
+      return valid
+    }
+
+    if (!enabled) {
+      return {
+        error: 'unavailable',
+        message: 'Images are unavailable because Note Stash is saving notes in app storage.',
+        ok: false
+      }
+    }
+
+    const file = imageFileName(noteId, index)
+    let result = null
+
+    try {
+      result = await files.writeText(folder, file, valid.dataUrl, { exclusive: true })
+    } catch (error) {
+      result = { error: error instanceof Error ? error.message : String(error), ok: false }
+    }
+
+    if (!result || !result.ok) {
+      return {
+        error: typeof result?.error === 'string' ? result.error : 'write-failed',
+        message: 'Note Stash could not save that image.',
+        ok: false
+      }
+    }
+
+    return {
+      image: {
+        bytes: valid.bytes,
+        file,
+        h: Number.isFinite(dimensions.h) && dimensions.h >= 0 ? dimensions.h : 0,
+        mime: valid.mime,
+        w: Number.isFinite(dimensions.w) && dimensions.w >= 0 ? dimensions.w : 0
+      },
+      ok: true
+    }
+  }
+
+  /** One image file as its data URL. A missing file is `{ok:false}` — the row
+   *  renders a placeholder, never a crash. */
+  const read = async file => {
+    if (!enabled) {
+      return { error: 'unavailable', ok: false }
+    }
+
+    let result = null
+
+    try {
+      result = await files.readText(folder, file)
+    } catch (error) {
+      result = { error: error instanceof Error ? error.message : String(error), ok: false }
+    }
+
+    if (!result || !result.ok) {
+      return { error: typeof result?.error === 'string' ? result.error : 'read-failed', ok: false }
+    }
+
+    const parsed = parseImageDataUrl(result.text)
+
+    if (!parsed) {
+      return { error: 'invalid-image', ok: false }
+    }
+
+    return { dataUrl: result.text.trim(), ok: true }
+  }
+
+  /** `{file: dataUrl|null}` for every image of every note; null = missing file. */
+  const readAll = async notes => {
+    const data = {}
+
+    for (const note of Array.isArray(notes) ? notes : []) {
+      for (const image of Array.isArray(note?.images) ? note.images : []) {
+        if (data[image.file] !== undefined) {
+          continue
+        }
+
+        const result = await read(image.file)
+        data[image.file] = result.ok ? result.dataUrl : null
+      }
+    }
+
+    return data
+  }
+
+  /** Move every image file of a deleted note to the OS trash. */
+  const trash = async images => {
+    if (!enabled) {
+      return false
+    }
+
+    let all = true
+
+    for (const image of Array.isArray(images) ? images : []) {
+      try {
+        const result = await files.trash(folder, image.file)
+
+        if (!result || !result.ok) {
+          all = false
+        }
+      } catch {
+        all = false
+      }
+    }
+
+    return all
+  }
+
+  return { enabled, read, readAll, trash, write }
 }
 
 export function appendNote(notes, note) {
