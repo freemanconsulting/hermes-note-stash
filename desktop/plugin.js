@@ -366,8 +366,22 @@ export function parseNotesPayload(raw, now = Date.now()) {
   for (const item of list) {
     const note = normalizeNote(item, now)
 
-    if (!note || seen.has(note.id)) {
+    if (!note) {
       continue
+    }
+
+    // A duplicate id (the capture dialog reused its draft id before 1.2.0)
+    // would make two rows share a status and a delete. The first occurrence
+    // keeps its id; each later duplicate gets a fresh one in file order, so the
+    // repair is deterministic and the image arrays are untouched.
+    if (seen.has(note.id)) {
+      let fresh = makeNoteId(now)
+
+      while (seen.has(fresh)) {
+        fresh = makeNoteId(now)
+      }
+
+      note.id = fresh
     }
 
     seen.add(note.id)
@@ -725,7 +739,19 @@ export async function putInComposerWithImages(note, { insertText, dispatchPaste,
 }
 
 export function appendNote(notes, note) {
-  return [note, ...notes]
+  const list = Array.isArray(notes) ? notes : []
+
+  if (!note || typeof note !== 'object') {
+    return list
+  }
+
+  const id = typeof note.id === 'string' ? note.id : ''
+  const taken = Boolean(id) && list.some(existing => existing?.id === id)
+
+  // Never store two notes under one id: a duplicate id makes one send mark both
+  // sent and one delete remove both. Mint a fresh id only — the image `file`
+  // names stay as they are, because image files are referenced by name.
+  return [taken ? { ...note, id: makeNoteId() } : note, ...list]
 }
 
 export function updateNote(notes, id, patch, now = Date.now()) {
@@ -2240,8 +2266,31 @@ function CaptureDialog({ stash }) {
   const [confirmDiscard, setConfirmDiscard] = useState(false)
   const bodyRef = useRef(null)
   const draftId = useRef('')
+  // Every image file written for the current draft, and whether the draft was
+  // saved. Both die with the dialog: a draft id must never outlive its dialog.
+  const draftFiles = useRef([])
+  const savedDraft = useRef(false)
   const dirty = Boolean(title.trim() || body.trim() || images.length)
   const canSave = Boolean(body.trim() || images.length)
+
+  // Every close path — save, cancel, discard, Esc, overlay click — lands here,
+  // because they all flip the open flag. Reusing a draft id across captures
+  // wrote the next note under the previous note's id (duplicate ids in
+  // notes.json); images added for a draft that was never saved are orphans and
+  // are trashed here, the one place that sees every close.
+  useEffect(() => {
+    if (open) {
+      return
+    }
+
+    if (!savedDraft.current && draftFiles.current.length) {
+      stash.discardImages(draftFiles.current)
+    }
+
+    savedDraft.current = false
+    draftFiles.current = []
+    draftId.current = ''
+  }, [open])
 
   /** Write each image file under the draft note id and hold it with its data
    *  URL for the thumbnail. */
@@ -2272,16 +2321,15 @@ function CaptureDialog({ stash }) {
 
       if (image) {
         next = [...next, { ...image, dataUrl }]
+        draftFiles.current = [...draftFiles.current, image]
         setImages(next)
       }
     }
   }
 
-  const close = (discardImages = true) => {
-    if (discardImages && images.length) {
-      stash.discardImages(images)
-    }
-
+  const close = () => {
+    // Image files are trashed by the open→closed effect, which also covers the
+    // paths that never reach this function (Esc, overlay click).
     stash.closeCapture()
     setTitle('')
     setBody('')
@@ -2304,7 +2352,9 @@ function CaptureDialog({ stash }) {
       return
     }
 
-    // The note takes ownership of the image files; close must not trash them.
+    // The note takes ownership of the image files; the close effect must not
+    // trash them, so the draft is marked saved before the flag flips.
+    savedDraft.current = true
     stash.addNote({
       body,
       id: draftId.current || undefined,
@@ -2312,7 +2362,7 @@ function CaptureDialog({ stash }) {
       title
     })
     haptic('tap')
-    close(false)
+    close()
   }
 
   return jsxs('div', {
@@ -2390,6 +2440,7 @@ function CaptureDialog({ stash }) {
               images,
               onRemove: image => {
                 setImages(images.filter(entry => entry.file !== image.file))
+                draftFiles.current = draftFiles.current.filter(entry => entry.file !== image.file)
                 stash.discardImages([image])
               },
               t

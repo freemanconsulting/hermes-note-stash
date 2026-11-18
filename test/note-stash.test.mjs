@@ -23,6 +23,7 @@ import { installStubs } from './loader.mjs'
 installStubs()
 
 const {
+  appendNote,
   createPersistence,
   createSendQueue,
   dataUrlToFile,
@@ -30,6 +31,7 @@ const {
   previewFor,
   putInComposerWithImages,
   sessionInfoConfirms,
+  setNoteStatus,
   titleFromRows,
   titleUpdateFromEvent
 } = await import('../desktop/plugin.js')
@@ -954,6 +956,61 @@ describe('app send paths', () => {
     for (const disposer of disposers) {
       disposer()
     }
+  })
+})
+
+describe('note ids', () => {
+  // The live bug: the capture dialog reused its draft id, so a text note saved
+  // after an image note landed on the image note's id. One send then marked
+  // both sent and one delete removed both, trashing the image note's file.
+  it('appendNote never stores a duplicate id and keeps both notes', () => {
+    const image = { bytes: 8, file: 'img-note-a-0.txt', h: 2, mime: 'image/png', w: 3 }
+    const first = { body: '', createdAt: 1, id: 'note-a', images: [image], status: 'active', title: 'image test', updatedAt: 1 }
+    const second = { body: 'text test', createdAt: 2, id: 'note-a', status: 'active', title: 'text test', updatedAt: 2 }
+
+    const notes = appendNote(appendNote([], first), second)
+
+    assert.equal(notes.length, 2, 'both notes are kept')
+    assert.notEqual(notes[0].id, notes[1].id)
+    assert.equal(notes[1].id, 'note-a', 'the existing note keeps its id')
+    assert.equal(notes[0].body, 'text test')
+    assert.deepEqual(notes[1].images, [image], 'image file names survive the fresh id')
+  })
+
+  it('load repairs duplicate ids: the first keeps its id, images stay', () => {
+    const image = { bytes: 8, file: 'img-note-dup-0.txt', h: 2, mime: 'image/png', w: 3 }
+    const text = JSON.stringify({
+      notes: [
+        { body: '', createdAt: 1, id: 'note-dup', images: [image], status: 'active', title: 'image test', updatedAt: 1 },
+        { body: 'text test', createdAt: 2, id: 'note-dup', status: 'active', title: 'text test', updatedAt: 2 }
+      ],
+      version: 1
+    })
+
+    const notes = parseNotesFile(text)
+
+    assert.equal(notes.length, 2, 'both notes survive the repair')
+    assert.equal(notes[0].id, 'note-dup', 'the first occurrence keeps its id')
+    assert.notEqual(notes[1].id, notes[0].id)
+    assert.deepEqual(notes[0].images, [image], 'the image array is untouched')
+    assert.equal(notes[1].body, 'text test')
+  })
+
+  it('setNoteStatus on one deduped note changes only that one', () => {
+    const text = JSON.stringify({
+      notes: [
+        { body: 'image test', createdAt: 1, id: 'note-dup', status: 'active', title: 'image test', updatedAt: 1 },
+        { body: 'text test', createdAt: 2, id: 'note-dup', status: 'active', title: 'text test', updatedAt: 2 }
+      ],
+      version: 1
+    })
+    const notes = parseNotesFile(text)
+    const next = setNoteStatus(notes, notes[1].id, 'sent', { sentAt: 9, sentTo: 's1' })
+
+    assert.equal(next[1].status, 'sent')
+    assert.equal(next[1].sentAt, 9)
+    assert.equal(next[0].status, 'active', 'the other note is untouched')
+    assert.equal(next[0].sentAt, undefined)
   })
 })
 

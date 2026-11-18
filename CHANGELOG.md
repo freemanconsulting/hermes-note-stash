@@ -15,6 +15,8 @@
 - **Copy** stays text-only; its tooltip says so when the note has images.
 - Text-only notes keep the automatic **Send**, busy queue, waiting and delivery
   confirmation from 1.1.1, unchanged.
+- Fixed: a note saved after an image note could reuse its id; duplicate ids are
+  repaired on load.
 
 ## 1.1.1
 
