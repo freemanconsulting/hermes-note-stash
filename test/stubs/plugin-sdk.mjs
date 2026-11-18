@@ -41,6 +41,8 @@ export const host = {
   },
   notify: () => {},
   profileRoutes: async () => [],
+  retainProfile: async () => () => {},
+  requestProfile: async () => ({ path: '' }),
   listPersistedSessions: async () => ({ sessions: [] }),
   state: {
     busyBySession: atom({}),

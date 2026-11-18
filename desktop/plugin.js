@@ -647,6 +647,101 @@ export function createImageStore(ctx) {
   return { enabled, read, readAll, trash, write }
 }
 
+/**
+ * The send-side image calls. Route lookup uses the profile recorded with the
+ * queued entry (`host.profileRoutes()` → the route whose `profile` matches),
+ * never `host.request` (that reaches only the primary gateway). `retainProfile`
+ * pins the pooled socket across the attach calls and the detach rollback; both
+ * sequences release it in a `finally`. Attach is one `image.attach_bytes` per
+ * image, in order, and returns the staged paths so an attach error or an
+ * unconfirmed delivery can detach exactly what was staged.
+ */
+export function createImageSender({ profileRoutes, readText, requestProfile, retainProfile, folder = 'data' }) {
+  const routeFor = async profile => {
+    const routes = await profileRoutes()
+
+    return Array.isArray(routes) ? routes.find(route => route && route.profile === profile) ?? null : null
+  }
+
+  const attach = async item => {
+    if (!Array.isArray(item.images) || !item.images.length) {
+      return { ok: true, paths: [] }
+    }
+
+    const route = await routeFor(item.profile)
+
+    if (!route) {
+      return { error: 'no-route', ok: false, paths: [] }
+    }
+
+    const release = await retainProfile(route)
+    const paths = []
+
+    try {
+      for (const image of item.images) {
+        const read = await readText(folder, image.file)
+        const parsed = read && read.ok ? parseImageDataUrl(read.text) : null
+
+        if (!parsed) {
+          return { error: 'read-image', ok: false, paths }
+        }
+
+        const result = await requestProfile(route, 'image.attach_bytes', {
+          content_base64: parsed.base64,
+          filename: attachFilename(image),
+          session_id: item.sid
+        })
+        const path = result && typeof result.path === 'string' ? result.path : ''
+
+        if (!path) {
+          return { error: 'attach-image', ok: false, paths }
+        }
+
+        paths.push(path)
+      }
+
+      return { ok: true, paths }
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : String(error),
+        ok: false,
+        paths
+      }
+    } finally {
+      release()
+    }
+  }
+
+  /** Detach every staged path, re-pinning the route for the rollback. */
+  const detach = async (item, paths) => {
+    if (!Array.isArray(paths) || !paths.length) {
+      return
+    }
+
+    const route = await routeFor(item.profile)
+
+    if (!route) {
+      return
+    }
+
+    const release = await retainProfile(route)
+
+    try {
+      for (const path of paths) {
+        try {
+          await requestProfile(route, 'image.detach', { path, session_id: item.sid })
+        } catch {
+          // A failed detach must not block the rest of the rollback.
+        }
+      }
+    } finally {
+      release()
+    }
+  }
+
+  return { attach, detach }
+}
+
 export function appendNote(notes, note) {
   return [note, ...notes]
 }
@@ -795,6 +890,8 @@ export function sessionInfoConfirms(ev, sid, body) {
 export function createSendQueue({
   submit,
   isBusy,
+  attach = async () => ({ error: 'unavailable', ok: false, paths: [] }),
+  detach = async () => {},
   setTimeoutFn = (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeoutFn = handle => globalThis.clearTimeout(handle),
   setIntervalFn = (fn, ms) => globalThis.setInterval(fn, ms),
@@ -859,10 +956,61 @@ export function createSendQueue({
   /** One submit attempt. A throw is a false result, never a crash. */
   const submitItem = item => {
     try {
-      return submit(item.sid, item.body) === true
+      return submit(item.sid, item.text) === true
     } catch {
       return false
     }
+  }
+
+  /**
+   * The image send sequence for one item: attach every image (one
+   * `image.attach_bytes` per image, through the route resolved from the
+   * profile recorded at queue time), then submit immediately — no awaits
+   * between the last attach and the submit, because staged images are
+   * session-global and consumed by the next turn. On an attach error or a
+   * submit that returns false, detach every staged path so the user's next
+   * message does not inherit them. Returns `{ok, paths, error}`; `paths` are
+   * the staged paths still to roll back if delivery is never confirmed.
+   */
+  const deliver = async item => {
+    const staged = await attach(item)
+
+    if (!staged.ok) {
+      await detach(item, staged.paths)
+
+      return { error: 'attach', ok: false, paths: staged.paths }
+    }
+
+    let ok = false
+
+    try {
+      ok = submit(item.sid, item.text) === true
+    } catch {
+      ok = false
+    }
+
+    if (!ok) {
+      await detach(item, staged.paths)
+
+      return { error: 'submit', ok: false, paths: staged.paths }
+    }
+
+    return { ok: true, paths: staged.paths }
+  }
+
+  /**
+   * Run one attempt and hand its result to `done`. A text-only note stays
+   * synchronous (the 1.1.1 behaviour); an image note is async because attach
+   * and detach are host calls.
+   */
+  const attempt = (item, done) => {
+    if (!item.images.length) {
+      done({ ok: submitItem(item), paths: [] })
+
+      return
+    }
+
+    void deliver(item).then(done)
   }
 
   /**
@@ -879,6 +1027,9 @@ export function createSendQueue({
 
     clearConfirm(entry)
     entry.confirmItem = null
+    // The turn started, so the staged images were consumed with it: nothing
+    // to detach.
+    entry.confirmPaths = []
 
     if (entry.items[0] === item) {
       entry.items.shift()
@@ -896,11 +1047,14 @@ export function createSendQueue({
    * existed — the composer's own listener silently drops the event while the
    * chat is still hydrating. Hold the note at the head of the FIFO in
    * `confirming` (the row keeps showing Queued/Waiting) until the session proves
-   * a turn started, or 8 s pass and it goes back to `waiting` silently.
+   * a turn started, or 8 s pass and it goes back to `waiting` silently. An
+   * image note's staged paths are detached on that timeout, so the next typed
+   * message does not inherit them.
    */
-  const beginConfirm = (entry, item, sid) => {
+  const beginConfirm = (entry, item, sid, paths = []) => {
     entry.phase = 'confirming'
     entry.confirmItem = item
+    entry.confirmPaths = paths
     entry.confirmTimer = setTimeoutFn(() => {
       entry.confirmTimer = null
 
@@ -908,8 +1062,16 @@ export function createSendQueue({
         return
       }
 
+      const staged = entry.confirmPaths
+
       entry.confirmItem = null
+      entry.confirmPaths = []
       entry.phase = 'waiting'
+
+      if (staged.length) {
+        void detach(item, staged)
+      }
+
       onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'waiting' })
       syncWaitTimer()
     }, confirmMs)
@@ -927,6 +1089,8 @@ export function createSendQueue({
     }
 
     manual.delete(noteId)
+    // The turn started, so the staged images were consumed with it.
+    record.paths = []
     onEvent({ noteId, profile: record.item.profile, sid: record.item.sid, type: 'sent' })
 
     return true
@@ -958,11 +1122,24 @@ export function createSendQueue({
       // A retry supersedes any pending focus-settle timer for this session.
       clearSettle(entry)
 
-      if (!submitItem(item)) {
-        continue
-      }
+      attempt(item, result => {
+        if (result.ok) {
+          beginConfirm(entry, item, sid, result.paths)
 
-      beginConfirm(entry, item, sid)
+          return
+        }
+
+        if (result.error === 'attach') {
+          // Nothing was submitted and the staged paths are already detached:
+          // keep the note in its current state, report, and stop this send.
+          drop(item.noteId)
+          onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'imageFailed' })
+
+          return
+        }
+
+        // A submit that returned false stays waiting silently.
+      })
     }
 
     syncWaitTimer()
@@ -1041,17 +1218,26 @@ export function createSendQueue({
         return
       }
 
-      if (!submitItem(item)) {
+      attempt(item, result => {
+        if (result.ok) {
+          beginConfirm(entry, item, sid, result.paths)
+
+          return
+        }
+
+        if (result.error === 'attach') {
+          drop(item.noteId)
+          onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'imageFailed' })
+
+          return
+        }
+
         // The chat was not on screen: hold the head note in place (later notes
         // stay behind it) and retry when focus or busy changes, or on the tick.
         entry.phase = 'waiting'
         onEvent({ noteId: item.noteId, profile: item.profile, sid, type: 'waiting' })
         syncWaitTimer()
-
-        return
-      }
-
-      beginConfirm(entry, item, sid)
+      })
     }, settleMs)
   }
 
@@ -1062,10 +1248,11 @@ export function createSendQueue({
 
     const entry = record(sid)
     entry.items.push({
-      body: typeof note.body === 'string' ? note.body : '',
+      images: normalizeImages(note.images),
       noteId: note.id,
       profile: typeof profile === 'string' && profile ? profile : 'default',
-      sid
+      sid,
+      text: sendTextFor(note)
     })
     pump(sid)
 
@@ -1077,7 +1264,8 @@ export function createSendQueue({
    * the queue does. `true` is not proof of delivery, so the note stays Active
    * until the session proves a turn started; an unconfirmed submit after 8 s is
    * a real error (the user is looking at that chat) and reports `failed`.
-   * Returns `'failed'` or `'confirming'`.
+   * Returns `'failed'`, `'imageFailed'` or `'confirming'`; an image note returns
+   * a Promise for one of those because attach and detach are host calls.
    */
   const sendNow = (note, sid, profile) => {
     if (!sid || !note || !note.id) {
@@ -1085,30 +1273,56 @@ export function createSendQueue({
     }
 
     const item = {
-      body: typeof note.body === 'string' ? note.body : '',
+      images: normalizeImages(note.images),
       noteId: note.id,
       profile: typeof profile === 'string' && profile ? profile : 'default',
-      sid
+      sid,
+      text: sendTextFor(note)
     }
 
-    if (!submitItem(item)) {
-      return 'failed'
+    const startConfirm = paths => {
+      const record = { item, paths, sid, timer: null }
+      manual.set(note.id, record)
+      record.timer = setTimeoutFn(() => {
+        record.timer = null
+
+        if (manual.get(note.id) !== record) {
+          return
+        }
+
+        manual.delete(note.id)
+
+        if (record.paths.length) {
+          void detach(item, record.paths)
+        }
+
+        onEvent({ noteId: note.id, profile: item.profile, sid, type: 'failed' })
+      }, confirmMs)
+
+      return 'confirming'
     }
 
-    const record = { item, sid, timer: null }
-    manual.set(note.id, record)
-    record.timer = setTimeoutFn(() => {
-      record.timer = null
-
-      if (manual.get(note.id) !== record) {
-        return
+    if (!item.images.length) {
+      if (!submitItem(item)) {
+        return 'failed'
       }
 
-      manual.delete(note.id)
-      onEvent({ noteId: note.id, profile: item.profile, sid, type: 'failed' })
-    }, confirmMs)
+      return startConfirm([])
+    }
 
-    return 'confirming'
+    return deliver(item).then(result => {
+      if (result.ok) {
+        return startConfirm(result.paths)
+      }
+
+      if (result.error === 'attach') {
+        onEvent({ noteId: note.id, profile: item.profile, sid, type: 'imageFailed' })
+
+        return 'imageFailed'
+      }
+
+      return 'failed'
+    })
   }
 
   /** Whether a manual submit for this note is awaiting delivery confirmation. */
@@ -1128,6 +1342,10 @@ export function createSendQueue({
     }
 
     manual.delete(noteId)
+
+    if (record.paths.length) {
+      void detach(record.item, record.paths)
+    }
 
     return true
   }
@@ -1199,13 +1417,13 @@ export function createSendQueue({
         continue
       }
 
-      if (sessionInfoConfirms(event, sid, entry.confirmItem.body)) {
+      if (sessionInfoConfirms(event, sid, entry.confirmItem.text)) {
         finishConfirm(entry, sid)
       }
     }
 
     for (const [noteId, record] of manual) {
-      if (sessionInfoConfirms(event, record.item.sid, record.item.body)) {
+      if (sessionInfoConfirms(event, record.item.sid, record.item.text)) {
         finishManual(noteId, record)
       }
     }
@@ -1247,6 +1465,36 @@ export function createSendQueue({
     }
   }
 
+  /** Remove a queued item without a `cancelled` event (an attach error stops the
+   *  send but the note keeps its current state). */
+  const drop = noteId => {
+    for (const [sid, entry] of sessions) {
+      const index = entry.items.findIndex(item => item.noteId === noteId)
+
+      if (index === -1) {
+        continue
+      }
+
+      entry.items.splice(index, 1)
+
+      if (!entry.items.length) {
+        clearTimers(entry)
+        entry.phase = 'idle'
+      } else if (index === 0) {
+        clearTimers(entry)
+        entry.phase = 'idle'
+        entry.sawBusy = false
+        pump(sid)
+      }
+
+      syncWaitTimer()
+
+      return true
+    }
+
+    return false
+  }
+
   const cancel = noteId => {
     // A manual confirmation in flight is silently dropped with the note.
     abandon(noteId)
@@ -1272,6 +1520,12 @@ export function createSendQueue({
         pump(sid)
       }
 
+      // A confirming image note's staged paths must not outlive the note.
+      if (entry.confirmItem && entry.confirmPaths?.length) {
+        void detach(entry.confirmItem, entry.confirmPaths)
+        entry.confirmPaths = []
+      }
+
       onEvent({ noteId, sid, type: 'cancelled' })
       syncWaitTimer()
 
@@ -1286,11 +1540,19 @@ export function createSendQueue({
   const dispose = () => {
     for (const entry of sessions.values()) {
       clearTimers(entry)
+
+      if (entry.confirmItem && entry.confirmPaths?.length) {
+        void detach(entry.confirmItem, entry.confirmPaths)
+      }
     }
 
     for (const record of manual.values()) {
       if (record.timer !== null) {
         clearTimeoutFn(record.timer)
+      }
+
+      if (record.paths.length) {
+        void detach(record.item, record.paths)
       }
     }
 
@@ -1493,9 +1755,22 @@ function createStash(ctx) {
   const $filter = atom('active')
   const $search = atom('')
   const $capture = atom(false)
+  // file → data URL, or null for a missing image file (a placeholder row).
+  const $imageData = atom({})
   const persistence = createPersistence(ctx, t)
+  const imageStore = createImageStore(ctx)
+  const imageSender = createImageSender({
+    folder: ctx.files?.dataFolder ?? 'data',
+    profileRoutes: () => host.profileRoutes(),
+    readText: (folder, file) => ctx.files.readText(folder, file),
+    requestProfile: (route, method, params) => host.requestProfile(route, method, params),
+    retainProfile: route => host.retainProfile(route)
+  })
+  let imagesDisabledNotified = false
 
   const queue = createSendQueue({
+    attach: item => imageSender.attach(item),
+    detach: (item, paths) => imageSender.detach(item, paths),
     submit: (sid, body) => host.composer.submit(sid, body),
     isBusy: sid => Boolean(host.state.busyBySession.get()[sid]),
     setTimeoutFn: (fn, ms) => ctx.setTimeout(fn, ms),
@@ -1506,6 +1781,14 @@ function createStash(ctx) {
       if (event.type === 'sent') {
         $notes.set(setNoteStatus($notes.get(), event.noteId, 'sent', { sentAt: Date.now(), sentTo: event.sid }))
         persistence.schedule($notes.get())
+
+        return
+      }
+
+      if (event.type === 'imageFailed') {
+        // Nothing was sent and the staged images were detached. The note keeps
+        // its current state (queued/waiting/active) so the user can retry it.
+        host.notify({ kind: 'error', message: t('imageSendFailed') })
 
         return
       }
@@ -1584,6 +1867,20 @@ function createStash(ctx) {
 
   const persist = () => persistence.schedule($notes.get())
 
+  /** Read every note's image files into the render cache. A missing file is
+   *  null → the row renders a placeholder. */
+  const loadImages = async notes => {
+    if (!imageStore.enabled) {
+      return
+    }
+
+    try {
+      $imageData.set(await imageStore.readAll(notes))
+    } catch {
+      // The rows render placeholders; never crash the pane for a read failure.
+    }
+  }
+
   const load = async () => {
     let loaded = []
 
@@ -1594,6 +1891,8 @@ function createStash(ctx) {
     }
 
     if (!loaded.length) {
+      void loadImages($notes.get())
+
       return
     }
 
@@ -1601,12 +1900,14 @@ function createStash(ctx) {
 
     if (!current.length) {
       $notes.set(loaded)
+      void loadImages(loaded)
 
       return
     }
 
     const known = new Set(current.map(note => note.id))
     $notes.set([...current, ...loaded.filter(note => !known.has(note.id))])
+    void loadImages($notes.get())
   }
 
   const dispose = () => {
@@ -1620,28 +1921,71 @@ function createStash(ctx) {
   return {
     $capture,
     $filter,
+    $imageData,
     $notes,
     $search,
+    addImage: async (noteId, images, dataUrl, dimensions) => {
+      if (!imageStore.enabled) {
+        if (!imagesDisabledNotified) {
+          imagesDisabledNotified = true
+          host.notify({ kind: 'error', message: t('imagesDisabled') })
+        }
+
+        return null
+      }
+
+      const result = await imageStore.write(noteId, nextImageIndex(images), dataUrl, dimensions)
+
+      if (!result.ok) {
+        host.notify({ kind: 'error', message: result.message || t('imageFailed') })
+
+        return null
+      }
+
+      return result.image
+    },
     addNote: input => {
       const note = createNote(input)
 
-      if (!note.body.trim() && !note.title.trim()) {
+      if (!note.body.trim() && !note.title.trim() && !note.images?.length) {
         return null
       }
 
       $notes.set(appendNote($notes.get(), note))
       persist()
+      void loadImages($notes.get())
 
       return note
     },
     cancelQueued: noteId => queue.cancel(noteId),
     closeCapture: () => $capture.set(false),
+    discardImages: images => {
+      if (Array.isArray(images) && images.length) {
+        void imageStore.trash(images)
+      }
+    },
     dispose,
     edit: (id, patch) => {
-      $notes.set(updateNote($notes.get(), id, patch))
+      const before = $notes.get().find(note => note.id === id)
+      const next = updateNote($notes.get(), id, patch)
+
+      // Images dropped by an edit are trashed; the note never keeps a dangling
+      // file reference.
+      if (before?.images?.length && Array.isArray(patch?.images)) {
+        const kept = new Set(patch.images.map(image => image?.file))
+        const removed = before.images.filter(image => !kept.has(image.file))
+
+        if (removed.length) {
+          void imageStore.trash(removed)
+        }
+      }
+
+      $notes.set(next)
       persist()
+      void loadImages(next)
     },
     load,
+    loadImages,
     openCapture: () => {
       haptic('tap')
       $capture.set(true)
@@ -1675,7 +2019,14 @@ function createStash(ctx) {
         .catch(() => host.notify({ kind: 'error', message: t('composerFailed') }))
     },
     remove: id => {
+      const note = $notes.get().find(entry => entry.id === id)
+
       queue.abandon(id)
+
+      if (note?.images?.length) {
+        void imageStore.trash(note.images)
+      }
+
       $notes.set(removeNote($notes.get(), id))
       persist()
     },
@@ -1720,8 +2071,22 @@ function createStash(ctx) {
       }
 
       // submit() returning true is not proof of delivery — the note stays Active
-      // until the session proves it started a turn (or reports `failed`).
-      if (queue.sendNow(note, sid, targetProfile) === 'failed') {
+      // until the session proves it started a turn (or reports `failed`). An
+      // image note resolves a Promise because attach/detach are host calls; an
+      // attach error already notified through the queue's `imageFailed` event.
+      const result = queue.sendNow(note, sid, targetProfile)
+
+      if (result && typeof result.then === 'function') {
+        void result.then(status => {
+          if (status === 'failed') {
+            host.notify({ kind: 'error', message: t('sendFailed') })
+          }
+        })
+
+        return
+      }
+
+      if (result === 'failed') {
         host.notify({ kind: 'error', message: t('sendFailed') })
       }
     }
@@ -2411,6 +2776,12 @@ export default {
         emptySentDesc: 'Notes you send to a session land here.',
         filterActive: count => `Active ${count}`,
         filterSent: count => `Sent ${count}`,
+        imageFailed: 'Note Stash could not add that image.',
+        imageMissing: 'Missing image',
+        imageMore: count => `+${count}`,
+        imageRemove: 'Remove image',
+        imageSendFailed: 'Note Stash could not attach this note’s images. Nothing was sent.',
+        imagesDisabled: 'Images are unavailable because Note Stash is saving notes in app storage.',
         new: 'New',
         newNote: 'New note',
         noSession: 'Open a session first — there is no focused session to send to.',
