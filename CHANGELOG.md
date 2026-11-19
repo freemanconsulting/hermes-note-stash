@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+
+- Changed (catalog review): Put in composer adds a note's text only. Images are
+  no longer attached automatically: click an image in a note to copy it, then
+  paste it into the composer. Removed: the synthetic paste event, the focus blur
+  and the host.navigate route correction (they relied on Desktop internals
+  outside the plugin SDK).
+
 ## 1.2.5
 
 - Changed: Mark as sent uses a check icon so it is not confused with Send.

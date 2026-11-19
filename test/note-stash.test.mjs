@@ -25,14 +25,12 @@ installStubs()
 
 const {
   appendNote,
+  copyImageToClipboard,
   createComposingTracker,
   createPersistence,
   createSendQueue,
-  dataUrlToFile,
   parseNotesFile,
   previewFor,
-  putInComposerWithImages,
-  recoverRouteFor,
   sessionInfoConfirms,
   setNoteStatus,
   titleFromRows,
@@ -166,320 +164,134 @@ describe('sessionInfoConfirms', () => {
   })
 })
 
-describe('dataUrlToFile', () => {
-  it('decodes a stored data URL into a File with the bytes and mime intact', async () => {
-    const file = dataUrlToFile('data:image/png;base64,iVBORw0KGgo=', 'note-image-0.png')
+describe('copyImageToClipboard', () => {
+  const PNG = 'data:image/png;base64,iVBORw0KGgo='
+  const JPEG = 'data:image/jpeg;base64,iVBORw0KGgo='
 
-    assert.equal(file.name, 'note-image-0.png')
-    assert.equal(file.type, 'image/png')
-    assert.equal(file.size, 8)
-    assert.deepEqual([...new Uint8Array(await file.arrayBuffer())], [137, 80, 78, 71, 13, 10, 26, 10])
-    assert.equal(dataUrlToFile('not-a-data-url', 'x.png'), null)
-    assert.equal(dataUrlToFile('data:image/png,abc', 'x.png'), null)
-  })
-})
+  function fakeClipboard() {
+    const writes = []
 
-describe('putInComposerWithImages', () => {
-  const IMAGES = [
-    { dataUrl: 'data:image/png;base64,iVBORw0KGgo=', file: 'img-note-0.txt', mime: 'image/png' },
-    { dataUrl: 'data:image/jpeg;base64,iVBORw0KGgo=', file: 'img-note-1.txt', mime: 'image/jpeg' }
-  ]
-
-  it('inserts the text once, then dispatches one paste with one File per image and focuses', async () => {
-    const inserts = []
-    const pastes = []
-    const focused = []
-    const notices = []
-
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
-
-          return true
-        },
-        focus: sid => focused.push(sid),
-        insertText: (sid, body, options) => {
-          inserts.push([sid, body, options])
-
-          return true
-        },
-        notify: message => notices.push(message),
-        sid: 'sess-1'
+    return {
+      writes,
+      write: async items => {
+        writes.push(items)
       }
-    )
+    }
+  }
 
-    assert.equal(ok, true)
-    assert.deepEqual(inserts, [['sess-1', 'hello', { mode: 'block' }]], 'the text goes in once as a block')
-    assert.equal(pastes.length, 1, 'one paste carries every image')
-    assert.deepEqual(
-      pastes[0].map(file => [file.name, file.type]),
-      [
-        ['note-image-0.png', 'image/png'],
-        ['note-image-1.jpg', 'image/jpeg']
-      ]
-    )
-    assert.deepEqual(focused, ['sess-1'], 'the composer is focused after the paste')
-    assert.deepEqual(notices, [])
-  })
+  function fakeClipboardItem() {
+    const built = []
 
-  it('retries a dropped paste and succeeds without an error', async () => {
-    const inserts = []
-    const pastes = []
-    const focused = []
-    const notices = []
-    const delays = []
-    let attempt = 0
-
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
-          attempt += 1
-
-          return attempt >= 3
-        },
-        focus: sid => focused.push(sid),
-        insertText: (sid, body, options) => {
-          inserts.push([sid, body, options])
-
-          return true
-        },
-        notify: message => notices.push(message),
-        setTimeout: (fn, ms) => {
-          delays.push(ms)
-          fn()
-
-          return () => {}
-        },
-        sid: 'sess-1'
+    class ClipboardItem {
+      constructor(items) {
+        built.push(items)
+        this.items = items
       }
-    )
-
-    assert.equal(ok, true)
-    assert.equal(pastes.length, 3, 'false, false, true is three paste attempts')
-    assert.equal(inserts.length, 1, 'the text goes in once, never again on a retry')
-    assert.deepEqual(delays, [250, 250], 'the attempts are 250 ms apart')
-    assert.deepEqual(notices, [], 'no error when a retry lands')
-    assert.deepEqual(focused, ['sess-1'], 'the composer is focused after the paste lands')
-  })
-
-  it('notifies and does not focus when the paste is not handled', async () => {
-    const inserts = []
-    const pastes = []
-    const focused = []
-    const notices = []
-
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
-
-          return false
-        },
-        focus: sid => focused.push(sid),
-        insertText: (sid, body, options) => {
-          inserts.push([sid, body, options])
-
-          return true
-        },
-        notify: message => notices.push(message),
-        setTimeout: fn => {
-          fn()
-
-          return () => {}
-        },
-        sid: 'sess-1'
-      }
-    )
-
-    assert.equal(ok, false)
-    assert.equal(pastes.length, 5, 'the first attempt plus four retries')
-    assert.equal(inserts.length, 1, 'the text goes in once, never again on a retry')
-    assert.deepEqual(notices, ['putInComposerImagesFailedWithText'], 'the text already went in, so the message says so')
-    assert.deepEqual(focused, [], 'no focus when the images did not land')
-  })
-
-  it('recovers the route once after a refused first paste and succeeds on the retry', async () => {
-    const pastes = []
-    const focused = []
-    const notices = []
-    const delays = []
-    const recovered = []
-    let attempt = 0
-
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
-          attempt += 1
-
-          return attempt >= 2
-        },
-        focus: sid => focused.push(sid),
-        insertText: () => true,
-        notify: message => notices.push(message),
-        recoverRoute: () => {
-          recovered.push('route')
-
-          return true
-        },
-        setTimeout: (fn, ms) => {
-          delays.push(ms)
-          fn()
-
-          return () => {}
-        },
-        sid: 'sess-1'
-      }
-    )
-
-    assert.equal(ok, true)
-    assert.equal(pastes.length, 2, 'the refused attempt then the retry')
-    assert.deepEqual(recovered, ['route'], 'the route is recovered exactly once')
-    assert.deepEqual(delays, [400], 'the retry waits for the router after the navigate')
-    assert.deepEqual(notices, [], 'no error when the retry lands')
-    assert.deepEqual(focused, ['sess-1'], 'the composer is focused after the paste lands')
-  })
-
-  it('recovers the route once and notifies once when every paste is refused', async () => {
-    const pastes = []
-    const notices = []
-    const delays = []
-    const recovered = []
-
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
-
-          return false
-        },
-        focus: () => {},
-        insertText: () => true,
-        notify: message => notices.push(message),
-        recoverRoute: () => {
-          recovered.push('route')
-
-          return true
-        },
-        setTimeout: (fn, ms) => {
-          delays.push(ms)
-          fn()
-
-          return () => {}
-        },
-        sid: 'sess-1'
-      }
-    )
-
-    assert.equal(ok, false)
-    assert.equal(pastes.length, 5, 'the first attempt plus four retries')
-    assert.deepEqual(recovered, ['route'], 'the route is recovered exactly once')
-    assert.deepEqual(delays, [400, 250, 250, 250], 'the retries are 250 ms apart after the navigate')
-    assert.deepEqual(notices, ['putInComposerImagesFailedWithText'], 'the error is notified once')
-  })
-
-  it('never recovers the route when the first paste is handled', async () => {
-    const recovered = []
-
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: () => true,
-        focus: () => {},
-        insertText: () => true,
-        notify: () => {},
-        recoverRoute: () => {
-          recovered.push('route')
-
-          return true
-        },
-        sid: 'sess-1'
-      }
-    )
-
-    assert.equal(ok, true)
-    assert.deepEqual(recovered, [], 'a handled first paste needs no route correction')
-  })
-
-  it('navigates to the focused chat route only when a stored session is focused', () => {
-    const navigated = []
-    const host = {
-      navigate: id => navigated.push(id),
-      state: { focusedStoredSessionId: { get: () => null } }
     }
 
-    assert.equal(recoverRouteFor(host)(), false)
-    assert.deepEqual(navigated, [], 'no focused stored session means no navigate')
+    return { built, ClipboardItem }
+  }
 
-    host.state.focusedStoredSessionId.get = () => 'local-abc'
+  it('writes one PNG item whose value is the original bytes', async () => {
+    const clipboard = fakeClipboard()
+    const { built, ClipboardItem } = fakeClipboardItem()
 
-    assert.equal(recoverRouteFor(host)(), true)
-    assert.deepEqual(navigated, ['/local-abc'])
-
-    host.state.focusedStoredSessionId.get = () => 'a/b'
-
-    recoverRouteFor(host)()
-
-    assert.deepEqual(navigated, ['/local-abc', '/a%2Fb'], 'the session id is encoded into the route')
-  })
-
-  it('does not insert text for an images-only note', async () => {
-    const inserts = []
-    const pastes = []
-
-    const ok = await putInComposerWithImages(
-      { body: '', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
-
-          return true
-        },
-        focus: () => {},
-        insertText: (sid, body) => {
-          inserts.push(body)
-
-          return true
-        },
-        notify: () => {},
-        sid: 'sess-1'
-      }
-    )
+    const ok = await copyImageToClipboard(async () => PNG, { clipboard, ClipboardItemCtor: ClipboardItem })
 
     assert.equal(ok, true)
-    assert.deepEqual(inserts, [], 'there is no text to insert')
-    assert.equal(pastes[0].length, 2)
+    assert.equal(clipboard.writes.length, 1, 'one write')
+    assert.equal(clipboard.writes[0].length, 1, 'one item')
+    assert.equal(clipboard.writes[0][0].items, built[0], 'the item built synchronously is the one written')
+
+    const blob = await built[0]['image/png']
+
+    assert.equal(blob.type, 'image/png')
+    assert.deepEqual([...new Uint8Array(await blob.arrayBuffer())], [137, 80, 78, 71, 13, 10, 26, 10])
   })
 
-  it('notifies composerFailed and dispatches no paste when insertText returns false', async () => {
-    const pastes = []
-    const notices = []
+  it('converts a non-PNG image to PNG before writing', async () => {
+    const clipboard = fakeClipboard()
+    const { built, ClipboardItem } = fakeClipboardItem()
+    const png = new Blob(['png'], { type: 'image/png' })
+    const converted = []
 
-    const ok = await putInComposerWithImages(
-      { body: 'hello', images: IMAGES },
-      {
-        dispatchPaste: files => {
-          pastes.push(files)
+    const ok = await copyImageToClipboard(async () => JPEG, {
+      clipboard,
+      ClipboardItemCtor: ClipboardItem,
+      toPng: async blob => {
+        converted.push(blob.type)
 
-          return true
-        },
-        focus: () => {},
-        insertText: () => false,
-        notify: message => notices.push(message),
-        sid: 'sess-1'
+        return png
       }
-    )
+    })
 
-    assert.equal(ok, false)
-    assert.deepEqual(notices, ['composerFailed'])
-    assert.deepEqual(pastes, [], 'no paste is attempted after a failed insert')
+    assert.equal(ok, true)
+    assert.deepEqual(converted, ['image/jpeg'], 'toPng is called once with the decoded blob')
+    assert.equal(await built[0]['image/png'], png, 'the converted PNG is written')
+  })
+
+  it('builds the ClipboardItem before the data URL resolves', async () => {
+    const clipboard = fakeClipboard()
+    const { built, ClipboardItem } = fakeClipboardItem()
+    let resolveLoad = null
+    let builtAtResolve = -1
+
+    const load = () =>
+      new Promise(resolve => {
+        resolveLoad = () => {
+          builtAtResolve = built.length
+          resolve(PNG)
+        }
+      })
+    const pending = copyImageToClipboard(load, { clipboard, ClipboardItemCtor: ClipboardItem })
+
+    assert.equal(built.length, 1, 'the item exists before the loader settles')
+
+    resolveLoad()
+
+    assert.equal(builtAtResolve, 1, 'the item was built before the loader resolved')
+    assert.equal(await pending, true)
+  })
+
+  it('returns false for an invalid or missing data URL', async () => {
+    const { ClipboardItem } = fakeClipboardItem()
+
+    assert.equal(
+      await copyImageToClipboard(async () => 'not-a-data-url', {
+        clipboard: fakeClipboard(),
+        ClipboardItemCtor: ClipboardItem
+      }),
+      false
+    )
+    assert.equal(
+      await copyImageToClipboard(async () => null, {
+        clipboard: fakeClipboard(),
+        ClipboardItemCtor: ClipboardItem
+      }),
+      false
+    )
+  })
+
+  it('returns false when the clipboard write rejects', async () => {
+    const { ClipboardItem } = fakeClipboardItem()
+
+    assert.equal(
+      await copyImageToClipboard(async () => PNG, {
+        clipboard: {
+          write: async () => {
+            throw new Error('denied')
+          }
+        },
+        ClipboardItemCtor: ClipboardItem
+      }),
+      false
+    )
+  })
+
+  it('returns false when the clipboard API is missing', async () => {
+    const { ClipboardItem } = fakeClipboardItem()
+
+    assert.equal(await copyImageToClipboard(async () => PNG, { clipboard: null, ClipboardItemCtor: ClipboardItem }), false)
   })
 })
 
@@ -1227,144 +1039,56 @@ describe('put in composer', () => {
     }
   })
 
-  it('moves an images-only note to Sent once when the chat starts a turn', async () => {
+  it('puts an image note with text in the composer as text only, with no DOM or route calls', async () => {
     const timers = fakeTimers()
-    const files = {
-      dataFolder: 'data',
-      list: async () => ({ files: [], ok: true }),
-      readText: async () => ({ ok: true, text: 'data:image/png;base64,iVBORw0KGgo=' }),
-      stat: async () => ({ ok: true }),
-      trash: async () => ({ ok: true }),
-      writeText: async () => ({ ok: true })
-    }
-    const { disposers, stash } = composingStash(timers, { files })
-    const note = stash.addNote({
-      images: [{ bytes: 8, file: 'img-note-img-0.txt', h: 2, mime: 'image/png', w: 3 }],
-      title: 'Images only'
-    })
-
-    // Desktop's paste path needs the browser globals dispatchImagePaste uses.
-    const original = {
-      ClipboardEvent: globalThis.ClipboardEvent,
-      DataTransfer: globalThis.DataTransfer,
-      window: globalThis.window
-    }
-
-    globalThis.DataTransfer = class {
-      constructor() {
-        this.items = { add: () => {} }
-      }
-    }
-    globalThis.ClipboardEvent = class {
-      constructor() {
-        this.defaultPrevented = true
-      }
-    }
-    globalThis.window = { dispatchEvent: () => {} }
-
-    try {
-      await stash.putInComposerImages(note)
-
-      assert.equal(stash.$notes.get()[0].status, 'active')
-      assert.equal(stash.$composing.get()[0].prefix, '', 'an images-only note has no text prefix')
-
-      sdk.host.state.busyBySession.set({ 'sess-1': true })
-
-      assert.equal(stash.$notes.get()[0].status, 'sent')
-      assert.equal(stash.$notes.get()[0].sentTo, 'sess-1')
-      assert.deepEqual(stash.$composing.get(), [])
-
-      const sentAt = stash.$notes.get()[0].sentAt
-
-      sdk.host.state.busyBySession.set({})
-      sdk.host.state.busyBySession.set({ 'sess-1': true })
-
-      assert.equal(stash.$notes.get()[0].sentAt, sentAt, 'a later turn does not re-send')
-    } finally {
-      globalThis.ClipboardEvent = original.ClipboardEvent
-      globalThis.DataTransfer = original.DataTransfer
-      globalThis.window = original.window
-    }
-
-    for (const disposer of disposers) {
-      disposer()
-    }
-  })
-
-  it('recovers a stale page route and puts an image note in the composer on the retry', async () => {
-    const timers = fakeTimers()
-    const navigated = []
     const notifications = []
-    const written = new Map()
-    const files = {
-      dataFolder: 'data',
-      list: async () => ({ files: [], ok: true }),
-      readText: async (folder, file) => ({
-        ok: true,
-        text: written.get(file) ?? 'data:image/png;base64,iVBORw0KGgo='
-      }),
-      stat: async () => ({ ok: true }),
-      trash: async () => ({ ok: true }),
-      writeText: async (folder, file, text) => {
-        written.set(file, text)
-
-        return { ok: true }
-      }
-    }
-    const { disposers, stash } = composingStash(timers, {
-      files,
-      // The paste retry delay fires immediately; the ten-minute composing
-      // timeout stays on the fake clock.
-      setTimeout: (fn, ms) => {
-        if (ms < 600000) {
-          fn()
-        }
-
-        return () => {}
-      }
-    })
+    const inserted = []
+    const { disposers, stash } = composingStash(timers)
     const note = stash.addNote({
+      body: 'Image note body',
       images: [{ bytes: 8, file: 'img-note-img-0.txt', h: 2, mime: 'image/png', w: 3 }],
-      title: 'Images only'
+      title: 'Image note'
     })
 
     sdk.host.notify = notification => notifications.push(notification)
-    sdk.host.navigate = id => navigated.push(id)
-    sdk.host.state.focusedStoredSessionId.set('stored-1')
+    sdk.host.composer.insertText = async (sid, body, options) => {
+      inserted.push({ body, options, sid })
 
+      return true
+    }
+
+    // Every mechanism the old synthetic-paste path used throws if touched:
+    // the text-only path must never reach for one.
+    const boom = () => {
+      throw new Error('called')
+    }
     const original = {
       ClipboardEvent: globalThis.ClipboardEvent,
       DataTransfer: globalThis.DataTransfer,
+      document: globalThis.document,
+      navigate: sdk.host.navigate,
       window: globalThis.window
     }
-    let paste = 0
 
-    globalThis.DataTransfer = class {
-      constructor() {
-        this.items = { add: () => {} }
-      }
-    }
-    globalThis.ClipboardEvent = class {
-      constructor() {
-        paste += 1
-        // The first paste is refused (Desktop's router is stuck on a page
-        // route); the retry after the navigate is handled.
-        this.defaultPrevented = paste > 1
-      }
-    }
-    globalThis.window = { dispatchEvent: () => {} }
+    globalThis.ClipboardEvent = boom
+    globalThis.DataTransfer = boom
+    globalThis.document = { activeElement: { blur: boom } }
+    globalThis.window = { dispatchEvent: boom }
+    sdk.host.navigate = boom
 
     try {
-      await stash.putInComposerImages(note)
-
-      assert.deepEqual(navigated, ['/stored-1'], 'the router returns to the chat being viewed')
-      assert.deepEqual(stash.$composing.get().map(record => record.noteId), [note.id], 'the composing record is set')
-      assert.deepEqual(notifications, [], 'no error when the retry lands')
+      await stash.putInComposer(note)
     } finally {
       globalThis.ClipboardEvent = original.ClipboardEvent
       globalThis.DataTransfer = original.DataTransfer
+      globalThis.document = original.document
       globalThis.window = original.window
+      sdk.host.navigate = original.navigate
     }
+
+    assert.deepEqual(inserted, [{ body: 'Image note body', options: { mode: 'block' }, sid: 'sess-1' }])
+    assert.deepEqual(stash.$composing.get().map(record => record.noteId), [note.id], 'the composing record is set')
+    assert.deepEqual(notifications, [{ kind: 'info', message: 'pasteImagesHint' }], 'one non-error hint, no error')
 
     for (const disposer of disposers) {
       disposer()

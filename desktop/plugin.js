@@ -58,15 +58,6 @@ const SEND_SETTLE_MS = 750
 const WAIT_RETRY_MS = 3000
 const CONFIRM_MS = 8000
 const FOCUS_SETTLE_MS = 1500
-// A paste can be dropped while a transient overlay is still on screen (a tooltip
-// closing, a popover the user just dismissed). Retry briefly before giving up.
-const PASTE_RETRY_COUNT = 4
-const PASTE_RETRY_MS = 250
-// Desktop's paste handler skips the paste while its router still shows a page
-// (e.g. the Capabilities → Plugins page used to update the plugin) even though
-// the chat is on screen. After correcting the route, give the router a moment
-// before the next attempt.
-const PASTE_ROUTE_RECOVER_MS = 400
 const CONFIRM_PREFIX_LENGTH = 40
 // A note put in the composer is only "in composer" while the user is plausibly
 // about to press Enter; after ten minutes the badge clears and the note stays
@@ -85,7 +76,7 @@ const KEYBIND_ID = 'note-stash.new-note'
 
 /** The plugin version, shown in the pane header. ONE source: the test asserts
  *  it equals `plugin.yaml` and `package.json`. */
-export const VERSION = '1.2.5'
+export const VERSION = '1.3.0'
 
 // Images are one flat UTF-8 text file per image in the plugin data folder,
 // holding exactly one data URL. `ctx.files.writeText` is UTF-8 only and capped
@@ -95,13 +86,6 @@ const IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 
 const IMAGE_FILE_PREFIX = 'img-'
 const IMAGE_FILE_SUFFIX = '.txt'
 const IMAGE_FILE_RE = /^img-.+-(\d+)\.txt$/
-const IMAGE_EXT_BY_MIME = {
-  'image/bmp': 'bmp',
-  'image/gif': 'gif',
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp'
-}
 
 /** `Send to "<title>"`, title truncated; no usable title → `Send to this chat`.
  *  The raw session id is never rendered. */
@@ -661,163 +645,90 @@ export function createImageStore(ctx) {
   return { enabled, read, readAll, trash, write }
 }
 
-/** A stored image data URL as a File, decoded with atob — never `fetch()` (a
- *  data URL needs no network, and fetch would make this async for nothing). */
-export function dataUrlToFile(dataUrl, name) {
+/** Decode a stored image data URL into a Blob, or null. Decoded with atob —
+ *  never `fetch()` (a data URL needs no network). */
+function dataUrlToBlob(dataUrl) {
   const parsed = parseImageDataUrl(dataUrl)
 
   if (!parsed) {
     return null
   }
 
-  let bytes = null
-
   try {
     const binary = globalThis.atob(parsed.base64)
-
-    bytes = new globalThis.Uint8Array(binary.length)
+    const bytes = new globalThis.Uint8Array(binary.length)
 
     for (let index = 0; index < binary.length; index += 1) {
       bytes[index] = binary.charCodeAt(index)
     }
+
+    return new globalThis.Blob([bytes], { type: parsed.mime })
   } catch {
     return null
   }
+}
+
+/** Convert any image Blob to PNG: Chromium's async clipboard writes only PNG. */
+export async function defaultToPng(blob) {
+  const bitmap = await globalThis.createImageBitmap(blob)
 
   try {
-    return new globalThis.File([bytes], name, { type: parsed.mime })
-  } catch {
-    return null
+    const canvas = new globalThis.OffscreenCanvas(bitmap.width, bitmap.height)
+
+    canvas.getContext('2d').drawImage(bitmap, 0, 0)
+
+    return await canvas.convertToBlob({ type: 'image/png' })
+  } finally {
+    bitmap.close?.()
   }
 }
 
 /**
- * The route correction for a stale page route: navigate to the chat the user is
- * already viewing, from the focused stored session id. Desktop's paste handler
- * refuses a paste while its router shows a page (`$workspaceIsPage`), even when
- * the chat is visibly on screen — the session route is `'/' +
- * encodeURIComponent(storedSessionId)`. No focused stored session → no navigate.
- * Takes the host so the wiring is unit-testable with a fake host. Returns true
- * when it navigated, false when there was no focused stored session.
+ * Copy one image to the system clipboard as PNG, from a data URL loader
+ * (`() => Promise<string|null>`). The ClipboardItem is built synchronously,
+ * before any await, so the write starts inside the user's click — Chromium
+ * rejects a clipboard write that waits. Returns true when the write landed;
+ * false on a missing clipboard, an invalid or missing data URL, or a rejected
+ * write — never throws.
  */
-export function recoverRouteFor(host) {
-  return () => {
-    let stored = ''
-
-    try {
-      stored = host?.state?.focusedStoredSessionId?.get?.() ?? ''
-    } catch {
-      stored = ''
-    }
-
-    if (typeof stored === 'string' && stored) {
-      host.navigate('/' + encodeURIComponent(stored))
-
-      return true
-    }
-
-    return false
-  }
-}
-
-/**
- * Put a note's text and images into the chat on screen. Text goes in first with
- * `insertText` (a block, never clobbering the draft); then the images go in as
- * real attachment chips through `dispatchPaste`, which dispatches a synthetic
- * paste carrying one File per image and returns whether Desktop's own paste
- * handler took it. Nothing is sent: the user presses Enter.
- *
- * Images carry their `dataUrl` (the app layer reads it from the image store).
- * An image whose file is missing cannot become a File and is left out; if no
- * image could be built, the paste is not dispatched and the error is shown.
- *
- * If the FIRST paste is refused, `recoverRoute` runs once (default: navigate to
- * the focused chat's route, correcting a router stuck on a page route) before
- * the retries continue.
- */
-export async function putInComposerWithImages(note, { insertText, dispatchPaste, focus, notify, sid, recoverRoute = recoverRouteFor(host), setTimeout: delay = (fn, ms) => globalThis.setTimeout(fn, ms) }) {
-  const body = typeof note?.body === 'string' ? note.body : ''
-  const images = Array.isArray(note?.images) ? note.images : []
-  const textAdded = Boolean(body.trim())
-
-  if (textAdded) {
-    let inserted = false
-
-    try {
-      inserted = Boolean(await insertText(sid, body, { mode: 'block' }))
-    } catch {
-      inserted = false
-    }
-
-    if (!inserted) {
-      notify('composerFailed')
-
-      return false
-    }
+export function copyImageToClipboard(
+  loadDataUrl,
+  { clipboard = globalThis.navigator?.clipboard, ClipboardItemCtor = globalThis.ClipboardItem, toPng = defaultToPng } = {}
+) {
+  if (!clipboard || !ClipboardItemCtor) {
+    return Promise.resolve(false)
   }
 
-  const files = []
+  let pngPromise = null
 
-  for (let index = 0; index < images.length; index += 1) {
-    const image = images[index]
-    const file = dataUrlToFile(
-      image?.dataUrl,
-      `note-image-${index}.${IMAGE_EXT_BY_MIME[image?.mime] || 'png'}`
-    )
+  try {
+    pngPromise = Promise.resolve(loadDataUrl()).then(dataUrl => {
+      const parsed = parseImageDataUrl(dataUrl)
+      const blob = dataUrlToBlob(dataUrl)
 
-    if (file) {
-      files.push(file)
-    }
-  }
-
-  if (!files.length) {
-    notify(textAdded ? 'putInComposerImagesFailedWithText' : 'putInComposerImagesFailed')
-
-    return false
-  }
-
-  // Each attempt builds a fresh DataTransfer + ClipboardEvent inside
-  // dispatchImagePaste, so a retry is never a re-dispatch of a spent event.
-  let handled = false
-  let routeRecovered = false
-
-  for (let attempt = 0; attempt <= PASTE_RETRY_COUNT; attempt += 1) {
-    if (attempt > 0) {
-      await new Promise(resolve =>
-        delay(resolve, routeRecovered && attempt === 1 ? PASTE_ROUTE_RECOVER_MS : PASTE_RETRY_MS)
-      )
-    }
-
-    try {
-      handled = dispatchPaste(files) === true
-    } catch {
-      handled = false
-    }
-
-    if (handled) {
-      break
-    }
-
-    // The first attempt was refused: Desktop may be treating the window as a
-    // page while the chat is on screen. Correct the router once, then retry.
-    if (attempt === 0) {
-      try {
-        routeRecovered = recoverRoute() === true
-      } catch {
-        routeRecovered = false
+      if (!parsed || !blob) {
+        throw new Error('invalid-image')
       }
-    }
+
+      return parsed.mime === 'image/png' ? blob : toPng(blob)
+    })
+  } catch {
+    return Promise.resolve(false)
   }
 
-  if (!handled) {
-    notify(textAdded ? 'putInComposerImagesFailedWithText' : 'putInComposerImagesFailed')
+  let item = null
 
-    return false
+  try {
+    item = new ClipboardItemCtor({ 'image/png': pngPromise })
+  } catch {
+    return Promise.resolve(false)
   }
 
-  focus(sid)
-
-  return true
+  return Promise.resolve()
+    .then(() => clipboard.write([item]))
+    .then(() => pngPromise)
+    .then(() => true)
+    .catch(() => false)
 }
 
 export function appendNote(notes, note) {
@@ -1988,38 +1899,6 @@ export function createPersistence(ctx, t) {
 
 // ── App layer: atoms + actions ─────────────────────────────────────────────
 
-/**
- * Dispatch a synthetic paste carrying image Files on `window`. Desktop's own
- * window paste handler (the same path as a real Cmd+V) routes it into the
- * active composer as attachment chips. It skips an event whose target is
- * editable, so drop focus from the pane's search box or any text field first;
- * it calls `preventDefault()` when it handled the paste, which is the signal.
- */
-function dispatchImagePaste(files) {
-  const active = globalThis.document?.activeElement
-  const tag = String(active?.tagName ?? '')
-
-  if (active && (active.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')) {
-    active.blur()
-  }
-
-  const transfer = new globalThis.DataTransfer()
-
-  for (const file of files) {
-    transfer.items.add(file)
-  }
-
-  const event = new globalThis.ClipboardEvent('paste', {
-    bubbles: true,
-    cancelable: true,
-    clipboardData: transfer
-  })
-
-  globalThis.window.dispatchEvent(event)
-
-  return event.defaultPrevented === true
-}
-
 function createStash(ctx) {
   const t = ctx.i18n.t
   const $notes = atom([])
@@ -2317,77 +2196,41 @@ function createStash(ctx) {
           // user presses Enter (a matching pending prompt) or ten minutes pass.
           composing.put({ body: note.body, noteId: note.id, profile, sid })
           host.composer.focus(sid)
+
+          if (note.images?.length) {
+            host.notify({ kind: 'info', message: t('pasteImagesHint') })
+          }
         })
         .catch(() => host.notify({ kind: 'error', message: t('composerFailed') }))
     },
-    putInComposerImages: async note => {
-      if (!note) {
+    copyImage: async (note, image) => {
+      if (!note || !image) {
         return
       }
 
-      const sid = host.state.focusedSessionId.get()
+      const loadDataUrl = async () => {
+        const cached = $imageData.get()[image.file]
 
-      if (!sid) {
-        host.notify({ kind: 'error', message: t('noSession') })
-
-        return
-      }
-
-      // Desktop's paste handler ignores a paste while a dialog is open, and the
-      // plugin's own capture dialog is the one that can be open over the pane.
-      if ($capture.get()) {
-        host.notify({ kind: 'error', message: t('composerFailed') })
-
-        return
-      }
-
-      // Each image needs its data URL: the render cache first, else a read of
-      // the stored file. A missing file stays null and is left out.
-      const images = []
-
-      for (const image of note.images ?? []) {
-        let dataUrl = $imageData.get()[image.file]
-
-        if (!dataUrl) {
-          try {
-            const read = await imageStore.read(image.file)
-
-            dataUrl = read.ok ? read.dataUrl : null
-          } catch {
-            dataUrl = null
-          }
+        if (cached) {
+          return cached
         }
 
-        images.push({ ...image, dataUrl })
+        try {
+          const read = await imageStore.read(image.file)
+
+          return read.ok ? read.dataUrl : null
+        } catch {
+          return null
+        }
       }
 
-      const ok = await putInComposerWithImages(
-        { ...note, images },
-        {
-          dispatchPaste: dispatchImagePaste,
-          focus: id => host.composer.focus(id),
-          insertText: (id, text, options) => host.composer.insertText(id, text, options),
-          notify: key => host.notify({ kind: 'error', message: t(key) }),
-          setTimeout: (fn, ms) => ctx.setTimeout(fn, ms),
-          sid
-        }
+      const ok = await copyImageToClipboard(loadDataUrl)
+
+      host.notify(
+        ok
+          ? { kind: 'success', message: t('imageCopied') }
+          : { kind: 'error', message: t('copyImageFailed') }
       )
-
-      if (!ok) {
-        return
-      }
-
-      // The text and images are in the composer: the note is "in composer"
-      // until Enter starts a turn (or ten minutes pass).
-      composing.put({
-        body: note.body,
-        noteId: note.id,
-        profile:
-          String(host.state.focusedSessionProfile.get() ?? '') ||
-          String(host.state.profile.get() ?? '') ||
-          'default',
-        sid
-      })
     },
     remove: id => {
       const note = $notes.get().find(entry => entry.id === id)
@@ -2616,7 +2459,7 @@ export function imageFilesFromClipboard(clipboard) {
 }
 
 /** Image files from a drop's `dataTransfer`. */
-export function imageFilesFromDataTransfer(transfer) {
+export function imageFilesFromTransfer(transfer) {
   const files = []
 
   if (transfer?.files?.length) {
@@ -2664,24 +2507,36 @@ export function imageMeta(image) {
   }
 }
 
-/** One thumbnail: the data URL, or a placeholder for a missing file. */
-function ImageThumb({ dataUrl, image, onRemove, removeLabel, size = 'h-14 w-14', t }) {
+/** One thumbnail: the data URL, or a placeholder for a missing file. With
+ *  `onCopy` and a data URL, the picture is a button that copies the image. */
+function ImageThumb({ dataUrl, image, onCopy, onRemove, removeLabel, size = 'h-14 w-14', t }) {
+  const picture = dataUrl
+    ? jsx('img', {
+        alt: '',
+        className: cn(size, 'rounded border border-(--stroke-nous) object-cover'),
+        src: dataUrl
+      })
+    : jsx('div', {
+        className: cn(
+          size,
+          'flex items-center justify-center rounded border border-(--stroke-nous) text-(--ui-text-tertiary)'
+        ),
+        children: jsx(icons.ImageIcon, { 'aria-label': t('imageMissing'), className: 'size-4' })
+      })
+
   return jsxs('div', {
     className: 'relative',
     children: [
-      dataUrl
-        ? jsx('img', {
-            alt: '',
-            className: cn(size, 'rounded border border-(--stroke-nous) object-cover'),
-            src: dataUrl
+      onCopy && dataUrl
+        ? jsx('button', {
+            'aria-label': t('copyImage'),
+            className: 'block',
+            onClick: () => onCopy(image),
+            title: t('copyImage'),
+            type: 'button',
+            children: picture
           })
-        : jsx('div', {
-            className: cn(
-              size,
-              'flex items-center justify-center rounded border border-(--stroke-nous) text-(--ui-text-tertiary)'
-            ),
-            children: jsx(icons.ImageIcon, { 'aria-label': t('imageMissing'), className: 'size-4' })
-          }),
+        : picture,
       onRemove
         ? jsx('button', {
             'aria-label': removeLabel ?? t('imageRemove'),
@@ -2697,8 +2552,8 @@ function ImageThumb({ dataUrl, image, onRemove, removeLabel, size = 'h-14 w-14',
   })
 }
 
-/** The editor's thumbnail grid, each with a remove button. */
-function ImageThumbnails({ images, onRemove, removeLabel, t }) {
+/** The editor's thumbnail grid, each with a copy and a remove button. */
+function ImageThumbnails({ images, onCopy, onRemove, removeLabel, t }) {
   if (!images.length) {
     return null
   }
@@ -2706,13 +2561,13 @@ function ImageThumbnails({ images, onRemove, removeLabel, t }) {
   return jsx('div', {
     className: 'flex flex-wrap gap-1.5',
     children: images.map(image =>
-      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onRemove, removeLabel, t })
+      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onCopy, onRemove, removeLabel, t })
     )
   })
 }
 
 /** A note row's thumbnail strip: max 3, then `+N`. */
-function ImageStrip({ data, images, t }) {
+function ImageStrip({ data, images, onCopy, t }) {
   const shown = images.slice(0, 3)
   const more = images.length - shown.length
 
@@ -2720,7 +2575,7 @@ function ImageStrip({ data, images, t }) {
     className: 'mt-1 flex items-center gap-1',
     children: [
       ...shown.map(image =>
-        jsx(ImageThumb, { dataUrl: data[image.file] ?? null, image, key: image.file, size: 'h-8 w-8', t })
+        jsx(ImageThumb, { dataUrl: data[image.file] ?? null, image, key: image.file, onCopy, size: 'h-8 w-8', t })
       ),
       more > 0
         ? jsx('span', {
@@ -2875,7 +2730,7 @@ function CaptureDialog({ stash }) {
           },
           onDrop: event => {
             event.preventDefault()
-            void addFiles(imageFilesFromDataTransfer(event.dataTransfer))
+            void addFiles(imageFilesFromTransfer(event.dataTransfer))
           },
           onPaste: event => {
             const files = imageFilesFromClipboard(event.clipboardData)
@@ -3041,7 +2896,7 @@ function NoteEditor({ note, onCancel, onSave, stash, t }) {
     },
     onDrop: event => {
       event.preventDefault()
-      void addFiles(imageFilesFromDataTransfer(event.dataTransfer))
+      void addFiles(imageFilesFromTransfer(event.dataTransfer))
     },
     onPaste: event => {
       const files = imageFilesFromClipboard(event.clipboardData)
@@ -3072,6 +2927,9 @@ function NoteEditor({ note, onCancel, onSave, stash, t }) {
       }),
       jsx(ImageThumbnails, {
         images,
+        // Every image can be copied from the editor, including the ones the
+        // note row's +N hides.
+        onCopy: image => stash.copyImage(note, image),
         // Removing a thumbnail only drops it from this editor's local state.
         // The file is trashed when Save persists the patch (stash.edit trashes
         // the images the patch drops); Cancel leaves the note's own files alone.
@@ -3162,13 +3020,18 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
                     'mt-1 line-clamp-2 whitespace-pre-wrap break-words font-mono text-[0.625rem] leading-[1.45] text-(--ui-text-quaternary)',
                   children: preview
                 })
-              : null,
-            hasImages
-              ? jsx(ImageStrip, { data: imageData, images: note.images, t })
               : null
           ]
         })
       }),
+      hasImages
+        ? jsx(ImageStrip, {
+            data: imageData,
+            images: note.images,
+            onCopy: image => stash.copyImage(note, image),
+            t
+          })
+        : null,
       queued
         ? jsxs('div', {
             className: 'mt-1 flex min-w-0 flex-wrap items-center gap-1.5',
@@ -3220,22 +3083,37 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
         className: 'mt-1 flex min-w-0 flex-wrap items-center gap-1',
         children: [
           hasImages
-            ? jsx(Button, {
-                // No Tip: a Radix tooltip layer over the button makes Desktop's
-                // window paste handler drop the image paste on a real click. The
-                // native title keeps the explanation without a DOM overlay.
-                'aria-label': t('putInComposer'),
-                disabled: !focused,
-                onClick: () => stash.putInComposerImages(note),
-                size: 'xs',
-                title: t('putInComposerImagesTip'),
-                type: 'button',
-                variant: 'ghost',
-                children: jsxs('span', {
-                  className: 'inline-flex items-center gap-1',
-                  children: [jsx(icons.PencilLine, { className: 'size-3' }), t('putInComposer')]
+            ? note.body.trim()
+              ? jsx(Tip, {
+                  label: t('putInComposerTextTip'),
+                  children: jsx(Button, {
+                    'aria-label': t('putInComposer'),
+                    disabled: !focused,
+                    onClick: () => stash.putInComposer(note),
+                    size: 'xs',
+                    type: 'button',
+                    variant: 'ghost',
+                    children: jsxs('span', {
+                      className: 'inline-flex items-center gap-1',
+                      children: [jsx(icons.PencilLine, { className: 'size-3' }), t('putInComposer')]
+                    })
+                  })
                 })
-              })
+              : jsx(Button, {
+                  // No Tip: a disabled button needs no tooltip layer, and the
+                  // native title says why it cannot add text.
+                  'aria-label': t('putInComposer'),
+                  disabled: true,
+                  onClick: () => stash.putInComposer(note),
+                  size: 'xs',
+                  title: t('imagesOnlyHint'),
+                  type: 'button',
+                  variant: 'ghost',
+                  children: jsxs('span', {
+                    className: 'inline-flex items-center gap-1',
+                    children: [jsx(icons.PencilLine, { className: 'size-3' }), t('putInComposer')]
+                  })
+                })
             : empty
               ? jsx(Button, {
                   // No Tip: a disabled button needs no tooltip layer, and the
@@ -3525,6 +3403,8 @@ export default {
         chipTip: count => `Note Stash — ${count} active ${count === 1 ? 'note' : 'notes'}`,
         composerFailed: 'Note Stash could not put this note in the composer.',
         copy: 'Copy note',
+        copyImage: 'Copy image, then paste it into the composer',
+        copyImageFailed: 'Note Stash could not copy this image.',
         copyImages: 'Copy note (text only)',
         delete: 'Delete',
         deleteDescription: 'It is removed from Note Stash for good.',
@@ -3541,11 +3421,13 @@ export default {
         filterActive: count => `Active ${count}`,
         filterSent: count => `Sent ${count}`,
         imageFailed: 'Note Stash could not add that image.',
+        imageCopied: 'Image copied. Paste it into the composer.',
         imageMissing: 'Missing image',
         imageMore: count => `+${count}`,
         imageRemove: 'Remove image',
         imageRemoveFromNote: 'Remove image from this note',
         imagesDisabled: 'Images are unavailable because Note Stash is saving notes in app storage.',
+        imagesOnlyHint: 'This note has no text. Click an image to copy it, then paste it into the composer.',
         inComposer: 'In composer',
         inComposerTip: 'Press Enter in the chat to send. Moves to Sent when it is sent.',
         markSent: 'Mark as sent',
@@ -3554,12 +3436,9 @@ export default {
         noSession: 'Open a session first — there is no focused session to send to.',
         nothingToSend: 'Nothing to send — add text or an image',
         paneTitle: 'Note Stash',
+        pasteImagesHint: 'Text added. Click each image in the note to copy it, then paste it into the composer.',
         putInComposer: 'Put in composer',
-        putInComposerImagesFailed:
-          'Note Stash could not add the images. Close any open dialog, click into the chat, and try again.',
-        putInComposerImagesFailedWithText:
-          'Note Stash could not add the images. The text was added. Close any open dialog, click into the chat, and try again.',
-        putInComposerImagesTip: 'Adds the text and images to the chat you are viewing — press Enter to send',
+        putInComposerTextTip: 'Adds the text to the chat you are viewing. Click an image to copy it, then paste it.',
         queuedLine: 'Queued — sends when the turn ends',
         restore: 'Restore to active',
         save: 'Save',

@@ -108,6 +108,59 @@ describe('render smoke', () => {
     return out
   }
 
+  /** The first element whose type is exactly `type`. */
+  function findByType(node, type, found = null) {
+    if (found || node === null || typeof node !== 'object') {
+      return found
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        found = findByType(child, type, found)
+
+        if (found) {
+          return found
+        }
+      }
+
+      return found
+    }
+
+    if (node.type === type) {
+      return node
+    }
+
+    if (typeof node.type === 'function') {
+      found = findByType(node.type(node.props ?? {}), type, found)
+
+      if (found) {
+        return found
+      }
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            found = findByType(item, type, found)
+
+            if (found) {
+              return found
+            }
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        found = findByType(value, type, found)
+
+        if (found) {
+          return found
+        }
+      }
+    }
+
+    return found
+  }
+
   /** Every button's aria-label inside one row element. */
   function buttonLabels(node, out = []) {
     if (node === null || typeof node !== 'object') {
@@ -525,7 +578,7 @@ describe('render smoke', () => {
     return found
   }
 
-  it('renders the image Put in composer button without a Tip overlay', () => {
+  it('renders image thumbnails as copy buttons outside the RowButton, and an images-only Put in composer disabled with a hint', () => {
     const contributions = []
     const ctx = {
       i18n: { register: () => {}, t: key => String(key) },
@@ -545,17 +598,30 @@ describe('render smoke', () => {
     const stash = pane.render().props.stash
 
     stash.addNote({
-      body: 'with images',
       images: [{ bytes: 8, file: 'img-note-img-0.txt', h: 2, mime: 'image/png', w: 3 }],
       title: 'Images only'
     })
+    // The row reads image data through the cache; seed it so the thumbnail is a
+    // real image (a missing file stays a placeholder and is never a button).
+    stash.$imageData.set({ 'img-note-img-0.txt': 'data:image/png;base64,iVBORw0KGgo=' })
 
     const rows = findRows(pane.render())
-    const button = findLabeledButton(rows[0], 'putInComposer')
+    const row = rows[0]
+    const rowButton = findByType(row, sdk.RowButton)
+    const button = findLabeledButton(row, 'putInComposer')
 
-    assert.ok(button, 'the image note has a Put in composer button')
-    assert.equal(button.inTip, false, 'no Tip ancestor: its popper layer would drop the paste on a real click')
-    assert.equal(button.element.props.title, 'putInComposerImagesTip', 'the explanation stays as the native title')
+    assert.ok(rowButton, 'the row has a RowButton')
+    assert.ok(buttonLabels(row).includes('copyImage'), 'the row thumbnail is a copy button')
+    assert.ok(!buttonLabels(rowButton).includes('copyImage'), 'no copy button is nested inside the RowButton')
+    assert.ok(button, 'the images-only note has a Put in composer button')
+    assert.equal(button.element.props.disabled, true, 'no text, so it is disabled')
+    assert.equal(button.element.props.title, 'imagesOnlyHint', 'the native title says why')
+    assert.equal(button.inTip, false, 'no Tip overlay on a disabled button')
+
+    // The editor's grid renders every image as a copy button too.
+    const editor = { type: row.type, props: { ...row.props, editing: true } }
+
+    assert.ok(buttonLabels(editor).includes('copyImage'), 'the editor thumbnail is a copy button')
   })
 
   /** Find the icon element inside the Mark as sent button (SmallAction renders
