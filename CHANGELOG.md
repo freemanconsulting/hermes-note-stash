@@ -5,6 +5,11 @@
 - Fixed: Put in composer for image notes failed when Desktop still treated the
   window as showing a page (for example after visiting Capabilities → Plugins);
   Note Stash now returns the router to the chat you are viewing and retries.
+- Fixed: Put in composer + Enter now moves the note to Sent on remote-gateway
+  connections too (proof: the note text leaves the composer draft as the turn
+  starts); a text deleted from the draft while idle clears the badge silently.
+- New: **Mark as sent** on active rows moves a note to Sent by hand, for a send
+  Note Stash cannot prove.
 
 ## 1.2.3
 

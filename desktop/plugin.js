@@ -72,6 +72,13 @@ const CONFIRM_PREFIX_LENGTH = 40
 // about to press Enter; after ten minutes the badge clears and the note stays
 // Active (in memory only, like `queued` — nothing survives a restart).
 const COMPOSING_TIMEOUT_MS = 10 * 60 * 1000
+// Draft proof: poll the composer draft while a record is live; a prefix that
+// vanishes while idle gets this grace for the busy flip that proves the send.
+const DRAFT_POLL_MS = 1000
+const DRAFT_GRACE_MS = 4000
+// A busy flip with no readable draft: the next poll within this window is the
+// fallback proof, and only for a prefix the draft was seen to hold.
+const DRAFT_UNKNOWN_MS = 2000
 const TITLE_LENGTH = 72
 const LABEL_TITLE_LENGTH = 32
 const KEYBIND_ID = 'note-stash.new-note'
@@ -954,23 +961,65 @@ export function sessionInfoConfirms(ev, sid, body, { running = true } = {}) {
  * the note stays Active; this record is what the row's muted badge reads. At
  * most one record per session: a newer Put in composer replaces it.
  *
- * Confirmation, exactly once per record:
+ * Confirmation, exactly once per record — whichever proof comes first:
  *  - a note with text is confirmed by a `session.info` event for its session
- *    whose `payload.pending` entry starts with the note's own prefix;
+ *    whose `payload.pending` entry starts with the note's own prefix (the local
+ *    wire); a remote gateway sends no pending text, so the draft is the proof;
+ *  - the composer draft stops holding the note's prefix as the session's busy
+ *    flag flips false → true (the turn started, so the text left the draft);
+ *  - a prefix that vanishes from the draft while the session is idle gets a
+ *    grace: a busy flip within it confirms, otherwise the user deleted the text
+ *    and the record is cleared silently;
  *  - an images-only note (no prefix) is confirmed by its session's busy flag
  *    flipping false → true, i.e. a turn starting.
  * A ten-minute timeout, a delete/edit, or a send another way clears the record
  * silently: the note stays Active and the badge disappears.
+ *
+ * Injected: `getDraft(sid) → string|null` (null = no live surface, which is
+ * unknown, never proof), `isBusy(sid) → boolean`, timers, and a clock. The draft
+ * poll runs only while at least one record is live.
  */
 export function createComposingTracker({
+  clearIntervalFn = handle => globalThis.clearInterval(handle),
   clearTimeoutFn = handle => handle(),
+  getDraft = () => null,
+  graceMs = DRAFT_GRACE_MS,
+  isBusy = () => false,
   now = () => Date.now(),
   onConfirm = () => {},
   onChange = () => {},
-  setTimeoutFn = (fn, ms) => globalThis.setTimeout(fn, ms)
+  pollMs = DRAFT_POLL_MS,
+  setIntervalFn = (fn, ms) => globalThis.setInterval(fn, ms),
+  setTimeoutFn = (fn, ms) => globalThis.setTimeout(fn, ms),
+  unknownMs = DRAFT_UNKNOWN_MS
 } = {}) {
   const records = new Map()
   let lastBusy = {}
+  let poll = null
+  let polling = false
+
+  const clearGrace = record => {
+    if (record.graceTimer !== null) {
+      clearTimeoutFn(record.graceTimer)
+      record.graceTimer = null
+    }
+  }
+
+  /** The poll exists only while a record does: no live record, no interval. */
+  const stopPoll = () => {
+    if (poll !== null) {
+      clearIntervalFn(poll)
+      poll = null
+    }
+  }
+
+  const ensurePoll = () => {
+    if (poll === null) {
+      poll = setIntervalFn(() => {
+        void runPoll()
+      }, pollMs)
+    }
+  }
 
   const drop = sid => {
     const record = records.get(sid)
@@ -984,7 +1033,12 @@ export function createComposingTracker({
       record.timer = null
     }
 
+    clearGrace(record)
     records.delete(sid)
+
+    if (!records.size) {
+      stopPoll()
+    }
 
     return true
   }
@@ -999,11 +1053,139 @@ export function createComposingTracker({
       record.timer = null
     }
 
+    clearGrace(record)
     records.delete(record.sid)
+
+    if (!records.size) {
+      stopPoll()
+    }
+
     onConfirm(record)
     onChange()
 
     return true
+  }
+
+  /** A draft read is a string, or null for unknown (no surface, or a throw). */
+  const readDraft = async sid => {
+    try {
+      const text = await getDraft(sid)
+      return typeof text === 'string' ? text : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Idle prefix-gone: the user may have deleted the text. A busy flip within
+   *  the grace is the proof; no flip means the record is cleared silently. */
+  const startGrace = record => {
+    if (record.graceTimer !== null) {
+      return
+    }
+
+    record.graceTimer = setTimeoutFn(() => {
+      record.graceTimer = null
+
+      if (records.get(record.sid) === record) {
+        drop(record.sid)
+        onChange()
+      }
+    }, graceMs)
+  }
+
+  /** One poll of one record's draft. */
+  const checkDraft = async record => {
+    const draft = await readDraft(record.sid)
+
+    if (records.get(record.sid) !== record) {
+      return
+    }
+
+    if (draft === null) {
+      // Unknown is never proof alone; a busy-flip window that expires is dropped.
+      if (record.unknownSince !== null && now() - record.unknownSince > unknownMs) {
+        record.unknownSince = null
+      }
+
+      return
+    }
+
+    if (draft.includes(record.prefix)) {
+      record.seenInDraft = true
+      record.unknownSince = null
+      clearGrace(record)
+
+      return
+    }
+
+    // The prefix left the draft. Within a busy flip's unknown window that is the
+    // proof; while idle it is only a deletion until a busy flip lands in time.
+    if (record.unknownSince !== null && now() - record.unknownSince <= unknownMs) {
+      confirm(record)
+
+      return
+    }
+
+    record.unknownSince = null
+
+    if (!isBusy(record.sid)) {
+      startGrace(record)
+    }
+  }
+
+  const runPoll = async () => {
+    if (polling) {
+      return
+    }
+
+    polling = true
+
+    try {
+      for (const record of [...records.values()]) {
+        if (record.prefix) {
+          await checkDraft(record)
+        }
+      }
+    } finally {
+      polling = false
+    }
+  }
+
+  /** The busy flip: the turn started, so the note text should have left the draft. */
+  const checkBusyFlip = async record => {
+    if (!record.prefix) {
+      confirm(record)
+
+      return
+    }
+
+    // A busy flip inside the grace is the proof a vanished prefix was sent.
+    if (record.graceTimer !== null) {
+      confirm(record)
+
+      return
+    }
+
+    const draft = await readDraft(record.sid)
+
+    if (records.get(record.sid) !== record) {
+      return
+    }
+
+    if (draft !== null) {
+      // Still holding the prefix: the user sent something else; stay Active.
+      if (!draft.includes(record.prefix)) {
+        confirm(record)
+      }
+
+      return
+    }
+
+    // Unknown draft: only a prefix the draft was seen to hold gets the fallback
+    // window; the next poll within it proves the send.
+    if (record.seenInDraft) {
+      record.unknownSince = now()
+    }
   }
 
   return {
@@ -1024,14 +1206,15 @@ export function createComposingTracker({
       for (const sid of [...records.keys()]) {
         drop(sid)
       }
+
+      stopPoll()
     },
     onBusyChange: busy => {
       const map = busy && typeof busy === 'object' ? busy : {}
 
       for (const record of [...records.values()]) {
-        // A prefixed note needs its own prompt text; a busy flip alone is not proof.
-        if (!record.prefix && map[record.sid] === true && lastBusy[record.sid] !== true) {
-          confirm(record)
+        if (map[record.sid] === true && lastBusy[record.sid] !== true) {
+          void checkBusyFlip(record)
         }
       }
 
@@ -1058,7 +1241,10 @@ export function createComposingTracker({
         profile,
         sid,
         startedAt: now(),
-        timer: null
+        timer: null,
+        graceTimer: null,
+        seenInDraft: false,
+        unknownSince: null
       }
 
       records.set(sid, record)
@@ -1067,9 +1253,15 @@ export function createComposingTracker({
 
         if (records.get(sid) === record) {
           records.delete(sid)
+
+          if (!records.size) {
+            stopPoll()
+          }
+
           onChange()
         }
       }, COMPOSING_TIMEOUT_MS)
+      ensurePoll()
       onChange()
 
       return record
@@ -1840,7 +2032,13 @@ function createStash(ctx) {
   const imageStore = createImageStore(ctx)
   const $composing = atom([])
   const composing = createComposingTracker({
+    clearIntervalFn: stop => stop(),
     clearTimeoutFn: handle => handle(),
+    // The draft is the proof on a remote gateway, where session.info carries no
+    // pending text: the note text leaves the draft as the turn starts.
+    getDraft: sid => host.composer.getDraft(sid),
+    isBusy: sid => Boolean(host.state.busyBySession.get()[sid]),
+    setIntervalFn: (fn, ms) => ctx.setInterval(fn, ms),
     onChange: () => $composing.set(composing.records()),
     onConfirm: record => {
       $notes.set(
@@ -2075,6 +2273,13 @@ function createStash(ctx) {
     },
     load,
     loadImages,
+    // Manual fallback for a send the plugin cannot prove (a remote gateway with
+    // no draft surface, or a send from another app): the user says it went out.
+    markSent: id => {
+      composing.clear(id)
+      $notes.set(setNoteStatus($notes.get(), id, 'sent', { sentAt: Date.now() }))
+      persist()
+    },
     openCapture: () => {
       haptic('tap')
       $capture.set(true)
@@ -3079,6 +3284,13 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
                 label: hasImages ? t('copyImages') : t('copy'),
                 text: note.body
               }),
+              !sent && !queued && !waiting
+                ? jsx(SmallAction, {
+                    icon: icons.Send,
+                    label: t('markSent'),
+                    onClick: () => stash.markSent(note.id)
+                  })
+                : null,
               sent
                 ? jsx(SmallAction, {
                     icon: icons.CornerDownLeft,
@@ -3336,6 +3548,7 @@ export default {
         imagesDisabled: 'Images are unavailable because Note Stash is saving notes in app storage.',
         inComposer: 'In composer',
         inComposerTip: 'Press Enter in the chat to send. Moves to Sent when it is sent.',
+        markSent: 'Mark as sent',
         new: 'New',
         newNote: 'New note',
         noSession: 'Open a session first — there is no focused session to send to.',

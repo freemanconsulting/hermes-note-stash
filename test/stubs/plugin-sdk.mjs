@@ -36,6 +36,7 @@ export const computed = fn => {
 export const host = {
   composer: {
     focus: () => {},
+    getDraft: async () => null,
     insertText: async () => false,
     submit: () => false
   },

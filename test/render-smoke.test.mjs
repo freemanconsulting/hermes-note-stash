@@ -556,4 +556,42 @@ describe('render smoke', () => {
     assert.equal(button.inTip, false, 'no Tip ancestor: its popper layer would drop the paste on a real click')
     assert.equal(button.element.props.title, 'putInComposerImagesTip', 'the explanation stays as the native title')
   })
+
+  it('renders Mark as sent on an active row and not on a sent one', () => {
+    const contributions = []
+    const ctx = {
+      i18n: { register: () => {}, t: key => String(key) },
+      onDispose: () => {},
+      onEvent: () => () => {},
+      register: contribution => contributions.push(contribution),
+      setInterval: () => () => {},
+      setTimeout: () => () => {},
+      storage: { get: (key, fallback) => fallback, set: () => {} }
+    }
+
+    sdk.host.state.focusedSessionId.set('sess-1')
+
+    plugin.register(ctx)
+
+    const pane = contributions.find(contribution => contribution.id === 'pane')
+    const stash = pane.render().props.stash
+    const active = stash.addNote({ body: 'still active', title: 'Active' })
+    const sent = stash.addNote({ body: 'already sent', title: 'Sent' })
+
+    stash.markSent(sent.id)
+    stash.$filter.set('active')
+
+    const activeRow = findRows(pane.render()).find(row => collectText(row).includes('Active'))
+
+    assert.ok(activeRow, 'the active row renders')
+    assert.ok(collectText(activeRow).includes('markSent'), 'the active row shows Mark as sent')
+    assert.ok(findLabeledButton(activeRow, 'markSent'), 'the action is a labeled button')
+
+    stash.$filter.set('sent')
+
+    const sentRow = findRows(pane.render()).find(row => collectText(row).includes('Sent'))
+
+    assert.ok(sentRow, 'the sent row renders')
+    assert.ok(!collectText(sentRow).includes('markSent'), 'a sent row has no Mark as sent')
+  })
 })

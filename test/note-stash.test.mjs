@@ -25,6 +25,7 @@ installStubs()
 
 const {
   appendNote,
+  createComposingTracker,
   createPersistence,
   createSendQueue,
   dataUrlToFile,
@@ -1406,6 +1407,177 @@ describe('put in composer', () => {
     assert.deepEqual(stash.$composing.get().map(record => record.noteId), [second.id])
     assert.equal(stash.$notes.get().find(note => note.id === first.id).status, 'active')
     assert.equal(stash.$notes.get().find(note => note.id === second.id).status, 'active')
+
+    for (const disposer of disposers) {
+      disposer()
+    }
+  })
+})
+
+/** Let the tracker's async draft reads settle. */
+const flushDraft = () => new Promise(resolve => setImmediate(resolve))
+
+describe('composing tracker draft proof', () => {
+  // The live bug: on a remote-gateway Desktop, session.info carries no pending
+  // text, so a prefixed note never confirmed and stayed In composer forever.
+  function draftTracker({ busy = {}, drafts = {}, timers = fakeTimers() } = {}) {
+    const confirmed = []
+    const changes = []
+    const tracker = createComposingTracker({
+      clearIntervalFn: timers.clearIntervalFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      getDraft: async sid =>
+        typeof drafts[sid] === 'function' ? drafts[sid]() : (drafts[sid] ?? null),
+      isBusy: sid => Boolean(busy[sid]),
+      onChange: () => changes.push(tracker.records()),
+      onConfirm: record => confirmed.push(record),
+      setIntervalFn: timers.setIntervalFn,
+      setTimeoutFn: timers.setTimeoutFn
+    })
+
+    return { busy, changes, confirmed, drafts, timers, tracker }
+  }
+
+  it('confirms a prefixed note when the busy flip finds the prefix gone from the draft', async () => {
+    const { busy, confirmed, drafts, timers, tracker } = draftTracker({
+      drafts: { s1: '1.2.3 text' }
+    })
+
+    tracker.put({ body: '1.2.3 text', noteId: 'n1', sid: 's1' })
+
+    assert.equal(timers.intervals(), 1, 'the draft poll is armed while a record is live')
+
+    drafts.s1 = 'something else'
+    busy.s1 = true
+    tracker.onBusyChange({ s1: true })
+    await flushDraft()
+
+    assert.deepEqual(confirmed.map(record => record.noteId), ['n1'])
+    assert.equal(timers.intervals(), 0, 'confirming stops the poll')
+    assert.equal(timers.pending(), 0, 'confirming cancels the ten-minute timer')
+  })
+
+  it('stays active when the busy flip finds the prefix still in the draft', async () => {
+    const { busy, confirmed, drafts, tracker } = draftTracker({ drafts: { s1: '1.2.3 text' } })
+
+    tracker.put({ body: '1.2.3 text', noteId: 'n1', sid: 's1' })
+
+    drafts.s1 = '1.2.3 text and more'
+    busy.s1 = true
+    tracker.onBusyChange({ s1: true })
+    await flushDraft()
+
+    assert.deepEqual(confirmed, [], 'the user sent something else')
+    assert.equal(tracker.records().length, 1, 'the note stays In composer')
+  })
+
+  it('confirms a prefix that vanishes while idle when a busy flip lands within the grace', async () => {
+    const { busy, confirmed, drafts, timers, tracker } = draftTracker({
+      drafts: { s1: '1.2.3 text' }
+    })
+
+    tracker.put({ body: '1.2.3 text', noteId: 'n1', sid: 's1' })
+
+    drafts.s1 = ''
+    timers.tick()
+    await flushDraft()
+
+    assert.ok(timers.pendingMs().includes(4000), 'the grace is armed')
+    assert.deepEqual(confirmed, [], 'a deletion alone is not proof')
+
+    busy.s1 = true
+    tracker.onBusyChange({ s1: true })
+    await flushDraft()
+
+    assert.deepEqual(confirmed.map(record => record.noteId), ['n1'])
+    assert.deepEqual(timers.pendingMs(), [], 'confirming cancels the grace')
+  })
+
+  it('clears the record silently when the prefix vanishes while idle and no busy flip lands', async () => {
+    const { changes, confirmed, drafts, timers, tracker } = draftTracker({
+      drafts: { s1: '1.2.3 text' }
+    })
+
+    tracker.put({ body: '1.2.3 text', noteId: 'n1', sid: 's1' })
+
+    drafts.s1 = ''
+    timers.tick()
+    await flushDraft()
+    timers.run()
+
+    assert.deepEqual(confirmed, [], 'the user deleted the text')
+    assert.equal(tracker.records().length, 0, 'the record is cleared')
+    assert.ok(changes.length > 0, 'the badge update is announced')
+    assert.equal(timers.intervals(), 0, 'the poll stops with the last record')
+  })
+
+  it('confirms exactly once when the pending-text and draft proofs both fire', async () => {
+    const { busy, confirmed, drafts, tracker } = draftTracker({ drafts: { s1: '1.2.3 text' } })
+
+    tracker.put({ body: '1.2.3 text', noteId: 'n1', sid: 's1' })
+    tracker.onSessionInfo({
+      session_id: 's1',
+      payload: { pending: [{ text: '1.2.3 text' }] }
+    })
+
+    assert.equal(confirmed.length, 1)
+
+    drafts.s1 = ''
+    busy.s1 = true
+    tracker.onBusyChange({ s1: true })
+    await flushDraft()
+
+    assert.equal(confirmed.length, 1, 'the draft proof cannot confirm twice')
+  })
+
+  it('never confirms on an unknown draft alone, but a seen prefix leaving within 2 s does', async () => {
+    const { busy, confirmed, drafts, timers, tracker } = draftTracker({
+      drafts: { s1: '1.2.3 text' }
+    })
+
+    tracker.put({ body: '1.2.3 text', noteId: 'n1', sid: 's1' })
+
+    timers.tick()
+    await flushDraft()
+
+    drafts.s1 = null
+    busy.s1 = true
+    tracker.onBusyChange({ s1: true })
+    await flushDraft()
+
+    assert.deepEqual(confirmed, [], 'no draft surface is unknown, never proof')
+
+    drafts.s1 = ''
+    timers.tick()
+    await flushDraft()
+
+    assert.deepEqual(confirmed.map(record => record.noteId), ['n1'])
+  })
+
+  it('Mark as sent moves the note to Sent and clears its composing record', async () => {
+    const timers = fakeTimers()
+
+    sdk.host.notify = () => {}
+    sdk.host.state.focusedSessionId.set('sess-1')
+    sdk.host.state.busyBySession.set({})
+    sdk.host.composer.insertText = async () => true
+
+    const { disposers, stash } = registerStash({ submit: () => true, ...fakeCtxTimers(timers) })
+    const note = stash.addNote({ body: 'manual sent', title: 'Manual' })
+
+    await stash.putInComposer(note)
+
+    assert.equal(stash.$composing.get().length, 1)
+
+    stash.markSent(note.id)
+
+    const sent = stash.$notes.get()[0]
+
+    assert.equal(sent.status, 'sent')
+    assert.ok(Number.isFinite(sent.sentAt), 'sentAt is stamped')
+    assert.equal(sent.sentTo, undefined, 'a manual mark names no target chat')
+    assert.deepEqual(stash.$composing.get(), [], 'the composing record is cleared')
+    assert.equal(timers.intervals(), 0, 'the draft poll stops')
 
     for (const disposer of disposers) {
       disposer()

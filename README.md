@@ -51,8 +51,9 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
 - **Pane** — a right-side pane (320px) listing notes with title/first line,
   relative time and status. Filter **Active** / **Sent**, search, and click a
   row to edit it inline. The secondary actions — **Put in composer**, **Copy**,
-  **Restore**, **Delete** — are always visible and muted, reaching full opacity
-  on hover or focus, so **Delete** is discoverable without hovering. Per note:
+  **Mark as sent**, **Restore**, **Delete** — are always visible and muted,
+  reaching full opacity on hover or focus, so **Delete** is discoverable without
+  hovering. Per note:
   - **Send** — sends the body to the focused session as the next prompt. The
     button's tooltip and accessible label name the target:
     `Send to "<session title>"`, or `Send to this chat` when the focused session
@@ -66,12 +67,20 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
     clobbers it) and then focuses the composer. The note stays Active with a
     muted **In composer** badge (tooltip: "Press Enter in the chat to send. Moves
     to Sent when it is sent.") until the chat sends it: pressing Enter starts a
-    turn with that text, which moves the note to Sent. The badge clears silently
-    after ten minutes, on an edit or delete, on a send another way, or when
-    another note is put in the composer for the same chat; nothing is persisted,
-    so a restart leaves the note Active. For a note with images this is the
-    labeled action instead of **Send**: it adds the text and the images (see
-    "Images").
+    turn with that text, which moves the note to Sent. The proof is the note text
+    leaving the composer draft as the turn starts, so it works on remote-gateway
+    connections too, where the chat's pending prompt is not visible to the plugin
+    (a matching pending prompt is an additional proof on a local connection); a
+    text deleted from the draft while the chat is idle clears the badge silently.
+    The badge clears silently after ten minutes, on an edit or delete, on a send
+    another way, or when another note is put in the composer for the same chat;
+    nothing is persisted, so a restart leaves the note Active. For a note with
+    images this is the labeled action instead of **Send**: it adds the text and
+    the images (see "Images").
+  - **Mark as sent** — on an active row, moves the note to Sent by hand (stamped
+    `sent <time>`, no target chat) and clears its **In composer** badge. The
+    fallback for a send Note Stash cannot prove: a remote gateway with no draft
+    surface, or a send from another app.
   - **Copy** — copies the body to the clipboard. Text only, like **Put in
     composer**.
   - **Delete** — removes the note after a confirmation. Always available,
