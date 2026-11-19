@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.4
+
+- Fixed: Put in composer for image notes failed when Desktop still treated the
+  window as showing a page (for example after visiting Capabilities → Plugins);
+  Note Stash now returns the router to the chat you are viewing and retries.
+
 ## 1.2.3
 
 - Fixed: removing an image in the editor no longer deletes its file until you

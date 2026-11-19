@@ -167,6 +167,14 @@ app restart, so nothing auto-sends when the app comes back.
 - **No telemetry**, no usage reporting, and no stored credentials.
 - The plugin reads and writes no files outside its own data folder.
 
+## Troubleshooting
+
+- **Put in composer for an image note does nothing, or shows an error.** Desktop
+  can still treat the window as showing a page (for example after visiting
+  Capabilities → Plugins) while a chat is on screen, and then refuses the image
+  paste. Note Stash returns the router to the chat you are viewing and retries;
+  if it still fails, click the chat in the sidebar once and try again.
+
 ## Development
 
 ```bash
@@ -191,7 +199,10 @@ read back from storage, exactly one warning toast is raised, and later writes do
 not re-warn; `dataUrlToFile` round-trips the bytes and mime of a stored data URL;
 `putInComposerWithImages` inserts the text once, dispatches one paste with one
 File per image and focuses, skips the insert for an images-only note, and
-reports an error without focusing when the paste is not handled;
+reports an error without focusing when the paste is not handled; a refused
+first paste recovers the route once and lands on the retry, a handled first
+paste never recovers it, and `recoverRouteFor` navigates to the focused chat's
+route only when a stored session is focused;
 `previewFor` starts an untitled note's preview at its second line;
 `titleFromRows` matches a title by session id or lineage root id;
 `titleUpdateFromEvent` extracts a title from a `session.info` event. Editor image

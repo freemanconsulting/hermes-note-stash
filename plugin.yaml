@@ -1,5 +1,5 @@
 name: note-stash
-version: "1.2.3"
+version: "1.2.4"
 requires_hermes: ">=0.22.7"   # ctx.files first ships in v0.22.7; all other SDK symbols exist from v0.22.0
 description: "Sticky notes and a code stash for Hermes Desktop: capture a thought without interrupting the current turn, then send a note to the focused session as the next prompt, queued until a running turn ends."
 author: freemanconsulting

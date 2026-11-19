@@ -62,6 +62,11 @@ const FOCUS_SETTLE_MS = 1500
 // closing, a popover the user just dismissed). Retry briefly before giving up.
 const PASTE_RETRY_COUNT = 4
 const PASTE_RETRY_MS = 250
+// Desktop's paste handler skips the paste while its router still shows a page
+// (e.g. the Capabilities → Plugins page used to update the plugin) even though
+// the chat is on screen. After correcting the route, give the router a moment
+// before the next attempt.
+const PASTE_ROUTE_RECOVER_MS = 400
 const CONFIRM_PREFIX_LENGTH = 40
 // A note put in the composer is only "in composer" while the user is plausibly
 // about to press Enter; after ten minutes the badge clears and the note stays
@@ -73,7 +78,7 @@ const KEYBIND_ID = 'note-stash.new-note'
 
 /** The plugin version, shown in the pane header. ONE source: the test asserts
  *  it equals `plugin.yaml` and `package.json`. */
-export const VERSION = '1.2.3'
+export const VERSION = '1.2.4'
 
 // Images are one flat UTF-8 text file per image in the plugin data folder,
 // holding exactly one data URL. `ctx.files.writeText` is UTF-8 only and capped
@@ -680,6 +685,35 @@ export function dataUrlToFile(dataUrl, name) {
 }
 
 /**
+ * The route correction for a stale page route: navigate to the chat the user is
+ * already viewing, from the focused stored session id. Desktop's paste handler
+ * refuses a paste while its router shows a page (`$workspaceIsPage`), even when
+ * the chat is visibly on screen — the session route is `'/' +
+ * encodeURIComponent(storedSessionId)`. No focused stored session → no navigate.
+ * Takes the host so the wiring is unit-testable with a fake host. Returns true
+ * when it navigated, false when there was no focused stored session.
+ */
+export function recoverRouteFor(host) {
+  return () => {
+    let stored = ''
+
+    try {
+      stored = host?.state?.focusedStoredSessionId?.get?.() ?? ''
+    } catch {
+      stored = ''
+    }
+
+    if (typeof stored === 'string' && stored) {
+      host.navigate('/' + encodeURIComponent(stored))
+
+      return true
+    }
+
+    return false
+  }
+}
+
+/**
  * Put a note's text and images into the chat on screen. Text goes in first with
  * `insertText` (a block, never clobbering the draft); then the images go in as
  * real attachment chips through `dispatchPaste`, which dispatches a synthetic
@@ -689,8 +723,12 @@ export function dataUrlToFile(dataUrl, name) {
  * Images carry their `dataUrl` (the app layer reads it from the image store).
  * An image whose file is missing cannot become a File and is left out; if no
  * image could be built, the paste is not dispatched and the error is shown.
+ *
+ * If the FIRST paste is refused, `recoverRoute` runs once (default: navigate to
+ * the focused chat's route, correcting a router stuck on a page route) before
+ * the retries continue.
  */
-export async function putInComposerWithImages(note, { insertText, dispatchPaste, focus, notify, sid, setTimeout: delay = (fn, ms) => globalThis.setTimeout(fn, ms) }) {
+export async function putInComposerWithImages(note, { insertText, dispatchPaste, focus, notify, sid, recoverRoute = recoverRouteFor(host), setTimeout: delay = (fn, ms) => globalThis.setTimeout(fn, ms) }) {
   const body = typeof note?.body === 'string' ? note.body : ''
   const images = Array.isArray(note?.images) ? note.images : []
   const textAdded = Boolean(body.trim())
@@ -734,10 +772,13 @@ export async function putInComposerWithImages(note, { insertText, dispatchPaste,
   // Each attempt builds a fresh DataTransfer + ClipboardEvent inside
   // dispatchImagePaste, so a retry is never a re-dispatch of a spent event.
   let handled = false
+  let routeRecovered = false
 
   for (let attempt = 0; attempt <= PASTE_RETRY_COUNT; attempt += 1) {
     if (attempt > 0) {
-      await new Promise(resolve => delay(resolve, PASTE_RETRY_MS))
+      await new Promise(resolve =>
+        delay(resolve, routeRecovered && attempt === 1 ? PASTE_ROUTE_RECOVER_MS : PASTE_RETRY_MS)
+      )
     }
 
     try {
@@ -748,6 +789,16 @@ export async function putInComposerWithImages(note, { insertText, dispatchPaste,
 
     if (handled) {
       break
+    }
+
+    // The first attempt was refused: Desktop may be treating the window as a
+    // page while the chat is on screen. Correct the router once, then retry.
+    if (attempt === 0) {
+      try {
+        routeRecovered = recoverRoute() === true
+      } catch {
+        routeRecovered = false
+      }
     }
   }
 
