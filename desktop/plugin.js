@@ -645,92 +645,6 @@ export function createImageStore(ctx) {
   return { enabled, read, readAll, trash, write }
 }
 
-/** Decode a stored image data URL into a Blob, or null. Decoded with atob —
- *  never `fetch()` (a data URL needs no network). */
-function dataUrlToBlob(dataUrl) {
-  const parsed = parseImageDataUrl(dataUrl)
-
-  if (!parsed) {
-    return null
-  }
-
-  try {
-    const binary = globalThis.atob(parsed.base64)
-    const bytes = new globalThis.Uint8Array(binary.length)
-
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index)
-    }
-
-    return new globalThis.Blob([bytes], { type: parsed.mime })
-  } catch {
-    return null
-  }
-}
-
-/** Convert any image Blob to PNG: Chromium's async clipboard writes only PNG. */
-export async function defaultToPng(blob) {
-  const bitmap = await globalThis.createImageBitmap(blob)
-
-  try {
-    const canvas = new globalThis.OffscreenCanvas(bitmap.width, bitmap.height)
-
-    canvas.getContext('2d').drawImage(bitmap, 0, 0)
-
-    return await canvas.convertToBlob({ type: 'image/png' })
-  } finally {
-    bitmap.close?.()
-  }
-}
-
-/**
- * Copy one image to the system clipboard as PNG, from a data URL loader
- * (`() => Promise<string|null>`). The ClipboardItem is built synchronously,
- * before any await, so the write starts inside the user's click — Chromium
- * rejects a clipboard write that waits. Returns true when the write landed;
- * false on a missing clipboard, an invalid or missing data URL, or a rejected
- * write — never throws.
- */
-export function copyImageToClipboard(
-  loadDataUrl,
-  { clipboard = globalThis.navigator?.clipboard, ClipboardItemCtor = globalThis.ClipboardItem, toPng = defaultToPng } = {}
-) {
-  if (!clipboard || !ClipboardItemCtor) {
-    return Promise.resolve(false)
-  }
-
-  let pngPromise = null
-
-  try {
-    pngPromise = Promise.resolve(loadDataUrl()).then(dataUrl => {
-      const parsed = parseImageDataUrl(dataUrl)
-      const blob = dataUrlToBlob(dataUrl)
-
-      if (!parsed || !blob) {
-        throw new Error('invalid-image')
-      }
-
-      return parsed.mime === 'image/png' ? blob : toPng(blob)
-    })
-  } catch {
-    return Promise.resolve(false)
-  }
-
-  let item = null
-
-  try {
-    item = new ClipboardItemCtor({ 'image/png': pngPromise })
-  } catch {
-    return Promise.resolve(false)
-  }
-
-  return Promise.resolve()
-    .then(() => clipboard.write([item]))
-    .then(() => pngPromise)
-    .then(() => true)
-    .catch(() => false)
-}
-
 export function appendNote(notes, note) {
   const list = Array.isArray(notes) ? notes : []
 
@@ -2203,35 +2117,6 @@ function createStash(ctx) {
         })
         .catch(() => host.notify({ kind: 'error', message: t('composerFailed') }))
     },
-    copyImage: async (note, image) => {
-      if (!note || !image) {
-        return
-      }
-
-      const loadDataUrl = async () => {
-        const cached = $imageData.get()[image.file]
-
-        if (cached) {
-          return cached
-        }
-
-        try {
-          const read = await imageStore.read(image.file)
-
-          return read.ok ? read.dataUrl : null
-        } catch {
-          return null
-        }
-      }
-
-      const ok = await copyImageToClipboard(loadDataUrl)
-
-      host.notify(
-        ok
-          ? { kind: 'success', message: t('imageCopied') }
-          : { kind: 'error', message: t('copyImageFailed') }
-      )
-    },
     remove: id => {
       const note = $notes.get().find(entry => entry.id === id)
 
@@ -2260,8 +2145,9 @@ function createStash(ctx) {
         return
       }
 
-      // Image notes are never sent from the pane: they go into the composer as
-      // attachments and the user presses Enter.
+      // Image notes are never sent from the pane: Send would drop the images.
+      // Their text goes in with Put in composer, and the user adds each image
+      // with right-click → Copy image and a paste.
       if (note.images?.length) {
         return
       }
@@ -2507,14 +2393,16 @@ export function imageMeta(image) {
   }
 }
 
-/** One thumbnail: the data URL, or a placeholder for a missing file. With
- *  `onCopy` and a data URL, the picture is a button that copies the image. */
-function ImageThumb({ dataUrl, image, onCopy, onRemove, removeLabel, size = 'h-14 w-14', t }) {
+/** One thumbnail: the data URL, or a placeholder for a missing file. The
+ *  picture is a plain `img` so Desktop's own context menu (right-click →
+ *  Copy image) acts on it — a plugin cannot write images to the clipboard. */
+function ImageThumb({ dataUrl, image, onRemove, removeLabel, size = 'h-14 w-14', t }) {
   const picture = dataUrl
     ? jsx('img', {
         alt: '',
         className: cn(size, 'rounded border border-(--stroke-nous) object-cover'),
-        src: dataUrl
+        src: dataUrl,
+        title: t('imageRightClickTip')
       })
     : jsx('div', {
         className: cn(
@@ -2527,16 +2415,7 @@ function ImageThumb({ dataUrl, image, onCopy, onRemove, removeLabel, size = 'h-1
   return jsxs('div', {
     className: 'relative',
     children: [
-      onCopy && dataUrl
-        ? jsx('button', {
-            'aria-label': t('copyImage'),
-            className: 'block',
-            onClick: () => onCopy(image),
-            title: t('copyImage'),
-            type: 'button',
-            children: picture
-          })
-        : picture,
+      picture,
       onRemove
         ? jsx('button', {
             'aria-label': removeLabel ?? t('imageRemove'),
@@ -2552,8 +2431,8 @@ function ImageThumb({ dataUrl, image, onCopy, onRemove, removeLabel, size = 'h-1
   })
 }
 
-/** The editor's thumbnail grid, each with a copy and a remove button. */
-function ImageThumbnails({ images, onCopy, onRemove, removeLabel, t }) {
+/** The editor's thumbnail grid, each with a remove button. */
+function ImageThumbnails({ images, onRemove, removeLabel, t }) {
   if (!images.length) {
     return null
   }
@@ -2561,13 +2440,13 @@ function ImageThumbnails({ images, onCopy, onRemove, removeLabel, t }) {
   return jsx('div', {
     className: 'flex flex-wrap gap-1.5',
     children: images.map(image =>
-      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onCopy, onRemove, removeLabel, t })
+      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onRemove, removeLabel, t })
     )
   })
 }
 
 /** A note row's thumbnail strip: max 3, then `+N`. */
-function ImageStrip({ data, images, onCopy, t }) {
+function ImageStrip({ data, images, t }) {
   const shown = images.slice(0, 3)
   const more = images.length - shown.length
 
@@ -2575,7 +2454,7 @@ function ImageStrip({ data, images, onCopy, t }) {
     className: 'mt-1 flex items-center gap-1',
     children: [
       ...shown.map(image =>
-        jsx(ImageThumb, { dataUrl: data[image.file] ?? null, image, key: image.file, onCopy, size: 'h-8 w-8', t })
+        jsx(ImageThumb, { dataUrl: data[image.file] ?? null, image, key: image.file, size: 'h-8 w-8', t })
       ),
       more > 0
         ? jsx('span', {
@@ -2927,9 +2806,6 @@ function NoteEditor({ note, onCancel, onSave, stash, t }) {
       }),
       jsx(ImageThumbnails, {
         images,
-        // Every image can be copied from the editor, including the ones the
-        // note row's +N hides.
-        onCopy: image => stash.copyImage(note, image),
         // Removing a thumbnail only drops it from this editor's local state.
         // The file is trashed when Save persists the patch (stash.edit trashes
         // the images the patch drops); Cancel leaves the note's own files alone.
@@ -3028,7 +2904,6 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
         ? jsx(ImageStrip, {
             data: imageData,
             images: note.images,
-            onCopy: image => stash.copyImage(note, image),
             t
           })
         : null,
@@ -3159,7 +3034,7 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
               jsx(CopyButton, {
                 appearance: 'icon',
                 buttonSize: 'icon-xs',
-                label: hasImages ? t('copyImages') : t('copy'),
+                label: t('copy'),
                 text: note.body
               }),
               !sent && !queued && !waiting
@@ -3403,9 +3278,6 @@ export default {
         chipTip: count => `Note Stash — ${count} active ${count === 1 ? 'note' : 'notes'}`,
         composerFailed: 'Note Stash could not put this note in the composer.',
         copy: 'Copy note',
-        copyImage: 'Copy image, then paste it into the composer',
-        copyImageFailed: 'Note Stash could not copy this image.',
-        copyImages: 'Copy note (text only)',
         delete: 'Delete',
         deleteDescription: 'It is removed from Note Stash for good.',
         deleteTitle: 'Delete this note?',
@@ -3421,13 +3293,12 @@ export default {
         filterActive: count => `Active ${count}`,
         filterSent: count => `Sent ${count}`,
         imageFailed: 'Note Stash could not add that image.',
-        imageCopied: 'Image copied. Paste it into the composer.',
         imageMissing: 'Missing image',
         imageMore: count => `+${count}`,
         imageRemove: 'Remove image',
         imageRemoveFromNote: 'Remove image from this note',
         imagesDisabled: 'Images are unavailable because Note Stash is saving notes in app storage.',
-        imagesOnlyHint: 'This note has no text. Click an image to copy it, then paste it into the composer.',
+        imagesOnlyHint: 'This note has no text. Right-click an image, choose Copy image, then paste it into the composer.',
         inComposer: 'In composer',
         inComposerTip: 'Press Enter in the chat to send. Moves to Sent when it is sent.',
         markSent: 'Mark as sent',
@@ -3436,9 +3307,10 @@ export default {
         noSession: 'Open a session first — there is no focused session to send to.',
         nothingToSend: 'Nothing to send — add text or an image',
         paneTitle: 'Note Stash',
-        pasteImagesHint: 'Text added. Click each image in the note to copy it, then paste it into the composer.',
+        pasteImagesHint: 'Text added. To add the images, right-click each one in the note, choose Copy image, then paste it into the composer.',
         putInComposer: 'Put in composer',
-        putInComposerTextTip: 'Adds the text to the chat you are viewing. Click an image to copy it, then paste it.',
+        putInComposerTextTip: 'Adds the text to the chat you are viewing. Right-click an image to copy it.',
+        imageRightClickTip: 'Right-click to copy this image',
         queuedLine: 'Queued — sends when the turn ends',
         restore: 'Restore to active',
         save: 'Save',

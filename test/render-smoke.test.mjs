@@ -578,7 +578,44 @@ describe('render smoke', () => {
     return found
   }
 
-  it('renders image thumbnails as copy buttons outside the RowButton, and an images-only Put in composer disabled with a hint', () => {
+  /** Every `img` element in a rendered tree, function components expanded. */
+  function findImgs(node, out = []) {
+    if (node === null || typeof node !== 'object') {
+      return out
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        findImgs(child, out)
+      }
+
+      return out
+    }
+
+    if (node.type === 'img') {
+      out.push(node)
+    }
+
+    if (typeof node.type === 'function') {
+      findImgs(node.type(node.props ?? {}), out)
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            findImgs(item, out)
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        findImgs(value, out)
+      }
+    }
+
+    return out
+  }
+
+  it('renders image thumbnails as plain right-clickable imgs outside the RowButton, and an images-only Put in composer disabled with a hint', () => {
     const contributions = []
     const ctx = {
       i18n: { register: () => {}, t: key => String(key) },
@@ -610,18 +647,30 @@ describe('render smoke', () => {
     const rowButton = findByType(row, sdk.RowButton)
     const button = findLabeledButton(row, 'putInComposer')
 
+    const imgs = findImgs(row)
+
     assert.ok(rowButton, 'the row has a RowButton')
-    assert.ok(buttonLabels(row).includes('copyImage'), 'the row thumbnail is a copy button')
-    assert.ok(!buttonLabels(rowButton).includes('copyImage'), 'no copy button is nested inside the RowButton')
+    assert.equal(imgs.length, 1, 'the row thumbnail is one img element')
+    assert.equal(imgs[0].props.title, 'imageRightClickTip', 'the thumbnail says right-click to copy')
+    assert.ok(
+      buttonLabels(row).includes('putInComposer'),
+      'no copy button: the only labeled button is Put in composer'
+    )
+    // Not a descendant of the RowButton: a button inside a button is invalid,
+    // and right-click must reach the img itself.
+    assert.equal(findImgs(rowButton).length, 0, 'the thumbnail img is outside the RowButton')
     assert.ok(button, 'the images-only note has a Put in composer button')
     assert.equal(button.element.props.disabled, true, 'no text, so it is disabled')
     assert.equal(button.element.props.title, 'imagesOnlyHint', 'the native title says why')
     assert.equal(button.inTip, false, 'no Tip overlay on a disabled button')
 
-    // The editor's grid renders every image as a copy button too.
+    // The editor's grid renders the same plain, right-clickable img thumbnails.
     const editor = { type: row.type, props: { ...row.props, editing: true } }
+    const editorImgs = findImgs(editor)
 
-    assert.ok(buttonLabels(editor).includes('copyImage'), 'the editor thumbnail is a copy button')
+    assert.equal(editorImgs.length, 1, 'the editor thumbnail is one img element')
+    assert.equal(editorImgs[0].props.title, 'imageRightClickTip', 'the editor thumbnail says right-click to copy')
+    assert.ok(!buttonLabels(editor).some(label => label.includes('copy')), 'no copy button in the editor grid')
   })
 
   /** Find the icon element inside the Mark as sent button (SmallAction renders

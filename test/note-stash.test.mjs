@@ -25,7 +25,6 @@ installStubs()
 
 const {
   appendNote,
-  copyImageToClipboard,
   createComposingTracker,
   createPersistence,
   createSendQueue,
@@ -161,137 +160,6 @@ describe('sessionInfoConfirms', () => {
     )
     assert.equal(sessionInfoConfirms({ session_id: 's1', payload: { pending: [{ text: 'x' }] } }, 's1', ''), false)
     assert.equal(sessionInfoConfirms(null, 's1', body), false)
-  })
-})
-
-describe('copyImageToClipboard', () => {
-  const PNG = 'data:image/png;base64,iVBORw0KGgo='
-  const JPEG = 'data:image/jpeg;base64,iVBORw0KGgo='
-
-  function fakeClipboard() {
-    const writes = []
-
-    return {
-      writes,
-      write: async items => {
-        writes.push(items)
-      }
-    }
-  }
-
-  function fakeClipboardItem() {
-    const built = []
-
-    class ClipboardItem {
-      constructor(items) {
-        built.push(items)
-        this.items = items
-      }
-    }
-
-    return { built, ClipboardItem }
-  }
-
-  it('writes one PNG item whose value is the original bytes', async () => {
-    const clipboard = fakeClipboard()
-    const { built, ClipboardItem } = fakeClipboardItem()
-
-    const ok = await copyImageToClipboard(async () => PNG, { clipboard, ClipboardItemCtor: ClipboardItem })
-
-    assert.equal(ok, true)
-    assert.equal(clipboard.writes.length, 1, 'one write')
-    assert.equal(clipboard.writes[0].length, 1, 'one item')
-    assert.equal(clipboard.writes[0][0].items, built[0], 'the item built synchronously is the one written')
-
-    const blob = await built[0]['image/png']
-
-    assert.equal(blob.type, 'image/png')
-    assert.deepEqual([...new Uint8Array(await blob.arrayBuffer())], [137, 80, 78, 71, 13, 10, 26, 10])
-  })
-
-  it('converts a non-PNG image to PNG before writing', async () => {
-    const clipboard = fakeClipboard()
-    const { built, ClipboardItem } = fakeClipboardItem()
-    const png = new Blob(['png'], { type: 'image/png' })
-    const converted = []
-
-    const ok = await copyImageToClipboard(async () => JPEG, {
-      clipboard,
-      ClipboardItemCtor: ClipboardItem,
-      toPng: async blob => {
-        converted.push(blob.type)
-
-        return png
-      }
-    })
-
-    assert.equal(ok, true)
-    assert.deepEqual(converted, ['image/jpeg'], 'toPng is called once with the decoded blob')
-    assert.equal(await built[0]['image/png'], png, 'the converted PNG is written')
-  })
-
-  it('builds the ClipboardItem before the data URL resolves', async () => {
-    const clipboard = fakeClipboard()
-    const { built, ClipboardItem } = fakeClipboardItem()
-    let resolveLoad = null
-    let builtAtResolve = -1
-
-    const load = () =>
-      new Promise(resolve => {
-        resolveLoad = () => {
-          builtAtResolve = built.length
-          resolve(PNG)
-        }
-      })
-    const pending = copyImageToClipboard(load, { clipboard, ClipboardItemCtor: ClipboardItem })
-
-    assert.equal(built.length, 1, 'the item exists before the loader settles')
-
-    resolveLoad()
-
-    assert.equal(builtAtResolve, 1, 'the item was built before the loader resolved')
-    assert.equal(await pending, true)
-  })
-
-  it('returns false for an invalid or missing data URL', async () => {
-    const { ClipboardItem } = fakeClipboardItem()
-
-    assert.equal(
-      await copyImageToClipboard(async () => 'not-a-data-url', {
-        clipboard: fakeClipboard(),
-        ClipboardItemCtor: ClipboardItem
-      }),
-      false
-    )
-    assert.equal(
-      await copyImageToClipboard(async () => null, {
-        clipboard: fakeClipboard(),
-        ClipboardItemCtor: ClipboardItem
-      }),
-      false
-    )
-  })
-
-  it('returns false when the clipboard write rejects', async () => {
-    const { ClipboardItem } = fakeClipboardItem()
-
-    assert.equal(
-      await copyImageToClipboard(async () => PNG, {
-        clipboard: {
-          write: async () => {
-            throw new Error('denied')
-          }
-        },
-        ClipboardItemCtor: ClipboardItem
-      }),
-      false
-    )
-  })
-
-  it('returns false when the clipboard API is missing', async () => {
-    const { ClipboardItem } = fakeClipboardItem()
-
-    assert.equal(await copyImageToClipboard(async () => PNG, { clipboard: null, ClipboardItemCtor: ClipboardItem }), false)
   })
 })
 
@@ -1062,11 +930,13 @@ describe('put in composer', () => {
     const boom = () => {
       throw new Error('called')
     }
+    const navigator = globalThis.navigator
     const original = {
       ClipboardEvent: globalThis.ClipboardEvent,
       DataTransfer: globalThis.DataTransfer,
       document: globalThis.document,
       navigate: sdk.host.navigate,
+      navigator,
       window: globalThis.window
     }
 
@@ -1074,6 +944,13 @@ describe('put in composer', () => {
     globalThis.DataTransfer = boom
     globalThis.document = { activeElement: { blur: boom } }
     globalThis.window = { dispatchEvent: boom }
+    globalThis.ClipboardItem = boom
+    // Desktop denies plugin clipboard image writes anyway (NotAllowedError);
+    // the plugin must not even reach for the API.
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { ...navigator, clipboard: { write: boom } }
+    })
     sdk.host.navigate = boom
 
     try {
@@ -1083,6 +960,15 @@ describe('put in composer', () => {
       globalThis.DataTransfer = original.DataTransfer
       globalThis.document = original.document
       globalThis.window = original.window
+      globalThis.ClipboardItem = original.ClipboardItem
+      if (original.navigator === undefined) {
+        delete globalThis.navigator
+      } else {
+        Object.defineProperty(globalThis, 'navigator', {
+          configurable: true,
+          value: original.navigator
+        })
+      }
       sdk.host.navigate = original.navigate
     }
 

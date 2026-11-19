@@ -3,8 +3,12 @@
 ## 1.3.0
 
 - Changed (catalog review): Put in composer adds a note's text only. Images are
-  no longer attached automatically: click an image in a note to copy it, then
-  paste it into the composer. Removed: the synthetic paste event, the focus blur
+  no longer attached automatically: right-click an image in a note (or in the
+  editor) and choose **Copy image** from Desktop's own context menu, then paste
+  it into the composer. A plugin cannot write images to the clipboard in Desktop
+  (the app grants clipboard image writes only to the Skills Hub), so Note Stash
+  makes no clipboard calls at all — thumbnails are plain images you right-click.
+  Removed: the synthetic paste event, the focus blur
   and the host.navigate route correction (they relied on Desktop internals
   outside the plugin SDK).
 

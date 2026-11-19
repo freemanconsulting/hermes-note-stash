@@ -105,14 +105,17 @@ the note's original images (only images added in that edit session are
 discarded).
 
 A note with images has **Put in composer** as its labeled action instead of
-**Send**. It adds the note's text only — never its images. Click any image in a
-note (or in the editor) to copy it to the system clipboard as PNG, then paste it
-into the composer with Cmd/Ctrl+V. An image note with text shows the labeled
-button and, after the text is added, one hint pointing you at the images; an
-images-only note's button is disabled with a native hint saying the same.
+**Send**. It adds the note's text only — never its images. To add an image,
+right-click it in the note (or in the editor) and choose **Copy image** from
+Desktop's own context menu, then paste it into the composer with Cmd/Ctrl+V. An
+image note with text shows the labeled button and, after the text is added, one
+hint pointing you at the images; an images-only note's button is disabled with a
+native hint saying the same. A plugin cannot write images to the clipboard in
+Desktop — the app grants clipboard image writes only to the Skills Hub — and
 Desktop's plugin SDK has no attach-file call yet, so Note Stash cannot add
-images to the composer directly; it will once `host.attachFileToComposer` ships
-(NousResearch/hermes-agent#84209). **Copy** stays text-only.
+images to the composer directly; it will attach them itself once
+`host.attachFileToComposer` ships (NousResearch/hermes-agent#84209). **Copy**
+stays text-only.
 
 ## Why the busy queue
 
@@ -153,10 +156,11 @@ app restart, so nothing auto-sends when the app comes back.
   of the session and shows one warning naming the failure. A missing or
   malformed `notes.json` is an empty store.
 - **Images.** Image files are read and written only as `img-*.txt` files in the
-  plugin's own data folder, one data URL per file. They leave the plugin only
-  when you click an image to copy it: the plugin reads the stored data URL and
-  writes it to the system clipboard as PNG through `navigator.clipboard`. **Copy**
-  writes the note text only. Nothing else reads or sends them.
+  plugin's own data folder, one data URL per file. They leave the plugin only as
+  the thumbnails it renders in its own pane; Note Stash itself never writes them
+  to the clipboard or anywhere else (a right-click **Copy image** is Desktop's
+  own menu acting on what you clicked). **Copy** writes the note text only.
+  Nothing else reads or sends them.
 - **No network calls and no third-party services.** The only session data the
   plugin reads is the focused profile's persisted-session list, through
   `host.listPersistedSessions` — a local read, no gateway dial — when the
@@ -169,8 +173,8 @@ app restart, so nothing auto-sends when the app comes back.
   the note body as a prompt to the focused session, which then goes to your
   configured model like any prompt you type. **Put in composer** inserts it into
   that session's draft; for a note with images it adds only the text, and you
-  click an image to copy it and paste it yourself. **Copy** writes it to the
-  clipboard. Nothing else sends note text anywhere.
+  right-click an image, choose **Copy image** and paste it yourself. **Copy**
+  writes it to the clipboard. Nothing else sends note text anywhere.
 - **No telemetry**, no usage reporting, and no stored credentials.
 - The plugin reads and writes no files outside its own data folder.
 
@@ -195,14 +199,11 @@ returns true but never starts a turn goes back to Waiting after 8 s; a persisted
 `queued` note loads as `active`; malformed/missing `notes.json` yields an empty
 store; a refused (`protected`) file write falls back to `ctx.storage`, the notes
 read back from storage, exactly one warning toast is raised, and later writes do
-not re-warn; `copyImageToClipboard` writes one PNG item whose value is the
-original bytes, converts a non-PNG image to PNG before writing, builds the
-ClipboardItem before the data URL resolves, and returns false for an invalid or
-missing data URL, a rejected write, or a missing clipboard; putting an image
-note with text in the composer inserts the text once as a block and shows one
-non-error hint, with the synthetic-paste globals, `host.navigate` and
+not re-warn; putting an image note with text in the composer inserts the text
+once as a block and shows one non-error hint, with the synthetic-paste globals,
+`navigator.clipboard.write`, `ClipboardItem`, `host.navigate` and
 `document.activeElement.blur` all replaced by throwing functions so none is
-reached;
+reached — the plugin never writes the clipboard itself;
 `previewFor` starts an untitled note's preview at its second line;
 `titleFromRows` matches a title by session id or lineage root id;
 `titleUpdateFromEvent` extracts a title from a `session.info` event. Editor image
