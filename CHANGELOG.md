@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.3
+
+- Fixed: removing an image in the editor no longer deletes its file until you
+  save, and Cancel keeps it. Removing a thumbnail only drops it from the editor;
+  the file is moved to the trash when Save persists the patch, and Cancel
+  discards only images added in that edit session.
+- Row actions (**Put in composer**, **Copy**, **Restore**, **Delete**) are always
+  visible and muted, reaching full opacity on hover or focus, instead of hidden
+  until hover — Delete is discoverable without hovering.
+- Empty notes (no body text and no images) can't be sent: **Send** is disabled
+  with a native title, and sending refuses silently. **Delete** always works.
+
 ## 1.2.2
 
 - **Put in composer** + **Enter** now moves the note to **Sent**: a note put in

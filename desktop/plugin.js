@@ -73,7 +73,7 @@ const KEYBIND_ID = 'note-stash.new-note'
 
 /** The plugin version, shown in the pane header. ONE source: the test asserts
  *  it equals `plugin.yaml` and `package.json`. */
-export const VERSION = '1.2.2'
+export const VERSION = '1.2.3'
 
 // Images are one flat UTF-8 text file per image in the plugin data folder,
 // holding exactly one data URL. `ctx.files.writeText` is UTF-8 only and capped
@@ -2155,6 +2155,12 @@ function createStash(ctx) {
         return
       }
 
+      // Nothing to send: no body text and no images. Refuse silently — the row's
+      // disabled Send button already explains it, so no error toast.
+      if (!note.body.trim() && !note.images?.length) {
+        return
+      }
+
       // Image notes are never sent from the pane: they go into the composer as
       // attachments and the user presses Enter.
       if (note.images?.length) {
@@ -2403,7 +2409,7 @@ export function imageMeta(image) {
 }
 
 /** One thumbnail: the data URL, or a placeholder for a missing file. */
-function ImageThumb({ dataUrl, image, onRemove, size = 'h-14 w-14', t }) {
+function ImageThumb({ dataUrl, image, onRemove, removeLabel, size = 'h-14 w-14', t }) {
   return jsxs('div', {
     className: 'relative',
     children: [
@@ -2422,10 +2428,11 @@ function ImageThumb({ dataUrl, image, onRemove, size = 'h-14 w-14', t }) {
           }),
       onRemove
         ? jsx('button', {
-            'aria-label': t('imageRemove'),
+            'aria-label': removeLabel ?? t('imageRemove'),
             className:
               'absolute -right-1.5 -top-1.5 inline-flex size-4 items-center justify-center rounded-full bg-(--ui-chat-bubble-background) text-(--ui-text-secondary) shadow-nous hover:text-foreground',
             onClick: () => onRemove(image),
+            title: removeLabel ?? t('imageRemove'),
             type: 'button',
             children: jsx(icons.X, { className: 'size-2.5' })
           })
@@ -2435,7 +2442,7 @@ function ImageThumb({ dataUrl, image, onRemove, size = 'h-14 w-14', t }) {
 }
 
 /** The editor's thumbnail grid, each with a remove button. */
-function ImageThumbnails({ images, onRemove, t }) {
+function ImageThumbnails({ images, onRemove, removeLabel, t }) {
   if (!images.length) {
     return null
   }
@@ -2443,7 +2450,7 @@ function ImageThumbnails({ images, onRemove, t }) {
   return jsx('div', {
     className: 'flex flex-wrap gap-1.5',
     children: images.map(image =>
-      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onRemove, t })
+      jsx(ImageThumb, { dataUrl: image.dataUrl, image, key: image.file, onRemove, removeLabel, t })
     )
   })
 }
@@ -2809,10 +2816,13 @@ function NoteEditor({ note, onCancel, onSave, stash, t }) {
       }),
       jsx(ImageThumbnails, {
         images,
+        // Removing a thumbnail only drops it from this editor's local state.
+        // The file is trashed when Save persists the patch (stash.edit trashes
+        // the images the patch drops); Cancel leaves the note's own files alone.
         onRemove: image => {
           setImages(images.filter(entry => entry.file !== image.file))
-          stash.discardImages([image])
         },
+        removeLabel: t('imageRemoveFromNote'),
         t
       }),
       jsxs('div', {
@@ -2844,6 +2854,9 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
   const waiting = note.status === 'waiting'
   const inComposer = composing.some(record => record.noteId === note.id)
   const hasImages = Boolean(note.images?.length)
+  // A note with no body text and no images has nothing to send: its Send button
+  // is disabled with a native title, and stash.send refuses it silently.
+  const empty = !note.body.trim() && !hasImages
   const title = deriveTitle(note, t('untitled'))
   const preview = previewFor(note)
   const stamp = relativeTime(Number.isFinite(note.updatedAt) ? note.updatedAt : note.createdAt)
@@ -2857,11 +2870,11 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
   // by the profile recorded when it was queued; no cached title → generic line.
   const waitingTitle = waiting ? titles[`${note.profile || titleProfile}:${note.sid}`] || '' : ''
 
-  // Secondary actions stay in the flow (no layout shift) but fade in on row
-  // hover or focus-within — tabbing into one reveals the whole cluster, so they
-  // remain keyboard-reachable. Send is the one labeled action and stays visible.
+  // Secondary actions render always, muted, and reach full opacity on row hover
+  // or focus-within — Delete must be discoverable without hovering. They stay in
+  // the flow (no layout shift), so queued/waiting/in-composer lines stay visible.
   const secondaryClass =
-    'flex items-center gap-0.5 opacity-0 transition-opacity group-hover/note:opacity-100 group-focus-within/note:opacity-100'
+    'flex items-center gap-0.5 text-(--ui-text-tertiary) opacity-70 transition-opacity group-hover/note:opacity-100 group-focus-within/note:opacity-100'
 
   return jsxs('div', {
     className: 'group/note row-hover rounded-md px-2 py-1.5',
@@ -2967,7 +2980,23 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
                   children: [jsx(icons.PencilLine, { className: 'size-3' }), t('putInComposer')]
                 })
               })
-            : jsx(Tip, {
+            : empty
+              ? jsx(Button, {
+                  // No Tip: a disabled button needs no tooltip layer, and the
+                  // native title says why it cannot send.
+                  'aria-label': t('nothingToSend'),
+                  disabled: true,
+                  onClick: () => stash.send(note),
+                  size: 'xs',
+                  title: t('nothingToSend'),
+                  type: 'button',
+                  variant: 'ghost',
+                  children: jsxs('span', {
+                    className: 'inline-flex items-center gap-1',
+                    children: [jsx(icons.Send, { className: 'size-3' }), t('send')]
+                  })
+                })
+              : jsx(Tip, {
                 label: sendLabel,
                 children: jsx(Button, {
                   'aria-label': sendLabel,
@@ -3252,12 +3281,14 @@ export default {
         imageMissing: 'Missing image',
         imageMore: count => `+${count}`,
         imageRemove: 'Remove image',
+        imageRemoveFromNote: 'Remove image from this note',
         imagesDisabled: 'Images are unavailable because Note Stash is saving notes in app storage.',
         inComposer: 'In composer',
         inComposerTip: 'Press Enter in the chat to send. Moves to Sent when it is sent.',
         new: 'New',
         newNote: 'New note',
         noSession: 'Open a session first — there is no focused session to send to.',
+        nothingToSend: 'Nothing to send — add text or an image',
         paneTitle: 'Note Stash',
         putInComposer: 'Put in composer',
         putInComposerImagesFailed:

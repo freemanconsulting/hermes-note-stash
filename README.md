@@ -50,13 +50,17 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
   would be lost). Paste or drop images into it (see "Images").
 - **Pane** — a right-side pane (320px) listing notes with title/first line,
   relative time and status. Filter **Active** / **Sent**, search, and click a
-  row to edit it inline. Per note:
+  row to edit it inline. The secondary actions — **Put in composer**, **Copy**,
+  **Restore**, **Delete** — are always visible and muted, reaching full opacity
+  on hover or focus, so **Delete** is discoverable without hovering. Per note:
   - **Send** — sends the body to the focused session as the next prompt. The
     button's tooltip and accessible label name the target:
     `Send to "<session title>"`, or `Send to this chat` when the focused session
-    has no usable title. Disabled when there is no focused session, and for a
-    note that is already sent or queued. If the target is mid-turn the note is
-    queued (see "Why the busy queue").
+    has no usable title. Disabled when there is no focused session, for a
+    note that is already sent or queued, and for an empty note (no body text and
+    no images), whose button carries the native title "Nothing to send — add
+    text or an image"; sending an empty note refuses silently. If the target is
+    mid-turn the note is queued (see "Why the busy queue").
   - **Put in composer** — appends the body to the focused session's existing
     draft (`host.composer.insertText(sid, body, { mode: 'block' })`, never
     clobbers it) and then focuses the composer. The note stays Active with a
@@ -70,7 +74,8 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
     "Images").
   - **Copy** — copies the body to the clipboard. Text only, like **Put in
     composer**.
-  - **Delete** — removes the note after a confirmation.
+  - **Delete** — removes the note after a confirmation. Always available,
+    including for an empty note.
   - **Restore** — on a sent note, moves it back to Active (label: "Restore to
     active").
 - **Send targets the session focused at click time**, never the session that
@@ -83,9 +88,12 @@ There is no build step and no dependencies: plain ESM, loaded uncompiled.
 Paste or drop PNG, JPEG, GIF, WebP or BMP images into the capture dialog or a
 note editor. Each image is stored as one `img-<note>-<n>.txt` text file holding
 its data URL in the plugin's own data folder, capped at ~3 MB per image. The
-editor shows thumbnails with a remove button; a row shows up to three with a
-`+N` count, and a missing file renders a placeholder instead of breaking the
-row.
+editor shows thumbnails with a **Remove image from this note** button; a row
+shows up to three with a `+N` count, and a missing file renders a placeholder
+instead of breaking the row. Removing a thumbnail only drops it from the
+editor: the file is moved to the trash when you **Save**, and **Cancel** keeps
+the note's original images (only images added in that edit session are
+discarded).
 
 A note with images has **Put in composer** as its labeled action instead of
 **Send**. It inserts the note's text into the chat you are viewing, then
@@ -186,11 +194,16 @@ File per image and focuses, skips the insert for an images-only note, and
 reports an error without focusing when the paste is not handled;
 `previewFor` starts an untitled note's preview at its second line;
 `titleFromRows` matches a title by session id or lineage root id;
-`titleUpdateFromEvent` extracts a title from a `session.info` event. An i18n
-completeness test checks every `t()` key against the registered English table,
-and a render smoke test registers the plugin against a fake context, renders
-every contribution, and executes component effects so a missing method called
-from an effect fails the test.
+`titleUpdateFromEvent` extracts a title from a `session.info` event. Editor image
+removal: a thumbnail removal trashes nothing and Cancel leaves the note's
+original image; a Save patch that drops an image trashes it exactly once; an
+identical patch trashes nothing. An empty note's send submits nothing and
+notifies nothing; a render smoke test checks **Delete** is present for active,
+sent and empty rows without hover and the empty row's **Send** is disabled. An
+i18n completeness test checks every `t()` key against the registered English
+table, and a render smoke test registers the plugin against a fake context,
+renders every contribution, and executes component effects so a missing method
+called from an effect fails the test.
 
 ## License
 

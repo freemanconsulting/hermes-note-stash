@@ -825,7 +825,7 @@ function registerStash({ files, submit, setInterval: setIntervalOverride, setTim
 
   const pane = contributions.find(contribution => contribution.id === 'pane')
 
-  return { disposers, events, stash: pane.render().props.stash }
+  return { disposers, events, pane, stash: pane.render().props.stash }
 }
 
 /** ctx.setTimeout/setInterval backed by the fake clock, as callable handles. */
@@ -1202,6 +1202,249 @@ describe('put in composer', () => {
     for (const disposer of disposers) {
       disposer()
     }
+  })
+})
+
+/** Invoke one component element; a stub component returning null stays itself. */
+function renderElement(element) {
+  if (!element || typeof element !== 'object') {
+    return element
+  }
+
+  if (typeof element.type === 'function') {
+    const rendered = element.type(element.props)
+
+    return rendered == null ? element : rendered
+  }
+
+  return element
+}
+
+/** Render every component in the tree, keeping stub components as their nodes. */
+function renderDeep(element) {
+  const rendered = renderElement(element)
+  const children = rendered?.props?.children
+
+  if (!children) {
+    return rendered
+  }
+
+  const list = Array.isArray(children) ? children : [children]
+  const next = list.map(child => (child && typeof child === 'object' ? renderDeep(child) : child))
+
+  return {
+    ...rendered,
+    props: { ...rendered.props, children: Array.isArray(children) ? next : next[0] }
+  }
+}
+
+/** Depth-first walk of a rendered element tree, visiting raw element nodes. */
+function findElements(element, predicate) {
+  const found = []
+
+  const visit = node => {
+    if (!node || typeof node !== 'object') {
+      return
+    }
+
+    if (predicate(node)) {
+      found.push(node)
+    }
+
+    const children = node.props?.children
+
+    for (const child of Array.isArray(children) ? children.flat(Infinity) : [children]) {
+      visit(child)
+    }
+  }
+
+  visit(element)
+
+  return found
+}
+
+/** A files fake: notes.json and image files share one in-memory folder. */
+function fakeFiles() {
+  const written = new Map()
+  const trashed = []
+
+  return {
+    files: {
+      dataFolder: 'data',
+      readText: async (folder, file) =>
+        written.has(file) ? { ok: true, text: written.get(file) } : { ok: false, error: 'not-found' },
+      trash: async (folder, file) => {
+        trashed.push(file)
+
+        return { ok: true }
+      },
+      writeText: async (folder, file, text) => {
+        written.set(file, text)
+
+        return { ok: true }
+      }
+    },
+    trashed
+  }
+}
+
+/** Let the image store's voided trash/read promises settle. */
+const flushAsync = () => new Promise(resolve => setImmediate(resolve))
+
+describe('editor image removal', () => {
+  const IMAGE = { bytes: 8, file: 'img-note-a-0.txt', h: 2, mime: 'image/png', w: 3 }
+
+  it('removing a thumbnail only drops it locally; Cancel trashes nothing and leaves the note', async () => {
+    const { files, trashed } = fakeFiles()
+    const { pane, stash } = registerStash({ files, submit: () => false })
+    const note = stash.addNote({ body: 'keep', images: [IMAGE], title: 'Image note' })
+    const discards = []
+    const original = stash.discardImages
+
+    stash.discardImages = images => {
+      discards.push(images)
+      original(images)
+    }
+
+    // Render the row in its editing state, then the editor's thumbnail grid.
+    const paneTree = renderElement(pane.render())
+    const row = findElements(paneTree, node => node.props?.note?.id === note.id)[0]
+    const editorTree = renderDeep({ type: row.type, props: { ...row.props, editing: true } })
+    const remove = findElements(
+      editorTree,
+      node => node.type === 'button' && node.props['aria-label'] === 'imageRemoveFromNote'
+    )
+
+    assert.equal(remove.length, 1, 'the thumbnail remove button is labelled for the note')
+    assert.equal(remove[0].props.title, 'imageRemoveFromNote', 'the native title carries the same label')
+
+    remove[0].props.onClick(IMAGE)
+    await flushAsync()
+
+    assert.deepEqual(discards, [], 'removing a thumbnail does not trash the file')
+    assert.deepEqual(trashed, [], 'no file is moved to the trash')
+
+    const cancel = findElements(
+      editorTree,
+      node => node.type === sdk.Button && node.props.children === 'cancel'
+    )[0]
+
+    cancel.props.onClick()
+    await flushAsync()
+
+    assert.deepEqual(trashed, [], 'Cancel leaves the note’s original image file alone')
+    assert.deepEqual(stash.$notes.get()[0].images, [IMAGE], 'Cancel leaves the note unchanged')
+  })
+
+  it('saving a patch without the image trashes it exactly once and updates the note', async () => {
+    const { files, trashed } = fakeFiles()
+    const { stash } = registerStash({ files, submit: () => false })
+    const note = stash.addNote({ body: 'keep', images: [IMAGE], title: 'Image note' })
+
+    await flushAsync()
+    assert.deepEqual(trashed, [], 'adding a note does not trash its image')
+
+    stash.edit(note.id, { body: 'keep', images: [], title: 'Image note' })
+    await flushAsync()
+
+    assert.deepEqual(trashed, [IMAGE.file], 'exactly one trash call for the dropped image')
+    assert.deepEqual(stash.$notes.get()[0].images, [], 'the note no longer references the image')
+  })
+
+  it('saving an identical patch trashes nothing', async () => {
+    const { files, trashed } = fakeFiles()
+    const { stash } = registerStash({ files, submit: () => false })
+    const note = stash.addNote({ body: 'keep', images: [IMAGE], title: 'Image note' })
+
+    stash.edit(note.id, { body: 'keep', images: [IMAGE], title: 'Image note' })
+    await flushAsync()
+
+    assert.deepEqual(trashed, [], 'an image kept by the patch is not trashed')
+    assert.deepEqual(stash.$notes.get()[0].images, [IMAGE])
+  })
+})
+
+describe('empty notes', () => {
+  it('send refuses silently: no submit and no notification', () => {
+    const submitted = []
+    const notifications = []
+
+    sdk.host.notify = notification => notifications.push(notification)
+    sdk.host.state.focusedSessionId.set('sess-1')
+
+    const { stash } = registerStash({
+      submit: (sid, body) => {
+        submitted.push(body)
+
+        return true
+      }
+    })
+
+    stash.send({ body: '   ', createdAt: 1, id: 'empty', status: 'active', title: '', updatedAt: 1 })
+
+    assert.deepEqual(submitted, [], 'nothing is submitted')
+    assert.deepEqual(notifications, [], 'the refusal is silent')
+  })
+})
+
+describe('row actions', () => {
+  it('Delete is rendered for active, sent and empty rows without hover; empty Send is disabled', () => {
+    const { pane, stash } = registerStash({ submit: () => false })
+    const active = stash.addNote({ body: 'active note', title: 'Active' })
+    const empty = { body: '', createdAt: 2, id: 'empty-note', status: 'active', title: '', updatedAt: 2 }
+    const sent = {
+      body: 'sent note',
+      createdAt: 3,
+      id: 'sent-note',
+      sentAt: 4,
+      sentTo: 's1',
+      status: 'sent',
+      title: 'Sent',
+      updatedAt: 4
+    }
+
+    stash.$notes.set([active, empty, sent])
+
+    const deleteCount = tree =>
+      findElements(tree, node => typeof node.type === 'function' && node.props?.label === 'delete').length
+
+    stash.$filter.set('active')
+    const activeTree = renderElement(pane.render())
+
+    for (const id of [active.id, empty.id]) {
+      const row = findElements(activeTree, node => node.props?.note?.id === id)[0]
+      const rendered = renderElement(row)
+
+      assert.equal(deleteCount(rendered), 1, `Delete is present for ${id} without hover`)
+      assert.ok(
+        findElements(
+          rendered,
+          node => typeof node.props?.className === 'string' && node.props.className.includes('opacity-70')
+        ).length > 0,
+        'the secondary actions are muted, not hidden'
+      )
+    }
+
+    const emptyRow = renderElement(findElements(activeTree, node => node.props?.note?.id === empty.id)[0])
+    const emptySend = findElements(
+      emptyRow,
+      node => node.type === sdk.Button && node.props['aria-label'] === 'nothingToSend'
+    )
+
+    assert.equal(emptySend.length, 1, 'the empty row has a Send button')
+    assert.equal(emptySend[0].props.disabled, true, 'the empty row’s Send is disabled')
+    assert.equal(emptySend[0].props.title, 'nothingToSend', 'the native title explains why')
+    assert.equal(
+      findElements(emptyRow, node => node.type === sdk.Tip && node.props?.label === 'nothingToSend').length,
+      0,
+      'no Tip wrapper around the disabled Send'
+    )
+
+    stash.$filter.set('sent')
+    const sentTree = renderElement(pane.render())
+    const sentRow = renderElement(findElements(sentTree, node => node.props?.note?.id === sent.id)[0])
+
+    assert.equal(deleteCount(sentRow), 1, 'Delete is present for a sent row without hover')
   })
 })
 
