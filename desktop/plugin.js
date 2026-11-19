@@ -85,7 +85,7 @@ const KEYBIND_ID = 'note-stash.new-note'
 
 /** The plugin version, shown in the pane header. ONE source: the test asserts
  *  it equals `plugin.yaml` and `package.json`. */
-export const VERSION = '1.2.4'
+export const VERSION = '1.2.5'
 
 // Images are one flat UTF-8 text file per image in the plugin data folder,
 // holding exactly one data URL. `ctx.files.writeText` is UTF-8 only and capped
@@ -3286,7 +3286,7 @@ function NoteRow({ editing, filter, note, onDelete, onToggleEdit, stash, t }) {
               }),
               !sent && !queued && !waiting
                 ? jsx(SmallAction, {
-                    icon: icons.Send,
+                    icon: icons.Check,
                     label: t('markSent'),
                     onClick: () => stash.markSent(note.id)
                   })

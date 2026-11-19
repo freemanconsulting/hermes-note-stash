@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.5
+
+- Changed: Mark as sent uses a check icon so it is not confused with Send.
+- Docs: README privacy section covers the composer draft check and route correction.
+
 ## 1.2.4
 
 - Fixed: Put in composer for image notes failed when Desktop still treated the

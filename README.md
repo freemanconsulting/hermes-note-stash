@@ -167,6 +167,8 @@ app restart, so nothing auto-sends when the app comes back.
   yet; it also listens to the local Hermes gateway's `session.info` events to
   pick up title changes. It uses only session ids and titles, only to label the
   Send button; if that fails, the label falls back to `Send to this chat`.
+- **Composer draft check.** After **Put in composer**, the plugin reads that chat's composer draft (`host.composer.getDraft`) once a second, only while the note is waiting to be sent and for at most 10 minutes, and compares it locally with the note text to tell when you sent it (the note moves to **Sent**). The draft is never stored or sent anywhere.
+- **Route correction.** If Desktop refuses the image paste because it still thinks a page is open, the plugin calls `host.navigate` once to return the router to the chat you are already viewing, then retries.
 - **Note text leaves the plugin only when you act.** Clicking **Send** submits
   the note body as a prompt to the focused session, which then goes to your
   configured model like any prompt you type. **Put in composer** inserts it into

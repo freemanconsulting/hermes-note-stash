@@ -63,6 +63,7 @@ export const useValue = store => store.get()
 // Only icons verified to exist in Hermes Desktop's lib/icons.ts at the
 // requires_hermes floor; add a name here only after checking it exists there.
 export const icons = {
+  Check: () => null,
   CornerDownLeft: () => null,
   FileImage: () => null,
   ImageIcon: () => null,

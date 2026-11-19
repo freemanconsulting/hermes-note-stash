@@ -19,6 +19,7 @@ installStubs()
 const plugin = (await import('../desktop/plugin.js')).default
 const { VERSION } = await import('../desktop/plugin.js')
 const sdk = await import('@hermes/plugin-sdk')
+const stubIcons = (await import('./stubs/plugin-sdk.mjs')).icons
 const react = await import('./stubs/react.mjs')
 
 /** Whether a prop value is a rendered element: jsx()/jsxs() output is { type, props }. */
@@ -557,6 +558,68 @@ describe('render smoke', () => {
     assert.equal(button.element.props.title, 'putInComposerImagesTip', 'the explanation stays as the native title')
   })
 
+  /** Find the icon element inside the Mark as sent button (SmallAction renders
+   * `jsx(Icon, { 'aria-hidden': true, ... })` inside its Button). */
+  function findMarkSentIcon(node, inMarkSentButton = false, found = null) {
+    if (found || node === null || typeof node !== 'object') {
+      return found
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        found = findMarkSentIcon(child, inMarkSentButton, found)
+
+        if (found) {
+          return found
+        }
+      }
+
+      return found
+    }
+
+    const inButton =
+      inMarkSentButton || (node.props?.type === 'button' && node.props['aria-label'] === 'markSent')
+
+    if (
+      inButton &&
+      typeof node.type === 'function' &&
+      node.props?.['aria-hidden'] === true &&
+      node.props?.className === 'size-3'
+    ) {
+      return node
+    }
+
+    if (typeof node.type === 'function' && !inButton) {
+      found = findMarkSentIcon(node.type(node.props ?? {}), inMarkSentButton, found)
+
+      if (found) {
+        return found
+      }
+    }
+
+    for (const value of Object.values(node.props ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          if (looksLikeElement(item)) {
+            found = findMarkSentIcon(item, inButton, found)
+
+            if (found) {
+              return found
+            }
+          }
+        }
+      } else if (looksLikeElement(value)) {
+        found = findMarkSentIcon(value, inButton, found)
+
+        if (found) {
+          return found
+        }
+      }
+    }
+
+    return found
+  }
+
   it('renders Mark as sent on an active row and not on a sent one', () => {
     const contributions = []
     const ctx = {
@@ -586,6 +649,14 @@ describe('render smoke', () => {
     assert.ok(activeRow, 'the active row renders')
     assert.ok(collectText(activeRow).includes('markSent'), 'the active row shows Mark as sent')
     assert.ok(findLabeledButton(activeRow, 'markSent'), 'the action is a labeled button')
+
+    // The Mark as sent action must use the check icon, not the paper plane:
+    // reusing icons.Send makes it indistinguishable from the Send button.
+    const markSentIcon = findMarkSentIcon(activeRow)
+
+    assert.ok(markSentIcon, 'the Mark as sent action renders an icon element')
+    assert.equal(markSentIcon.type, stubIcons.Check, 'the action uses the Check icon')
+    assert.notEqual(markSentIcon.type, stubIcons.Send, 'the action does not reuse the Send icon')
 
     stash.$filter.set('sent')
 
